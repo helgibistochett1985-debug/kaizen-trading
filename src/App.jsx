@@ -1822,25 +1822,25 @@ function TabBot({ market, selectedTickers, apiKey }) {
         const { allOk } = evalStrategy(strat, data, manuals);
         if (!allOk) continue;
 
-        addLog(`🟢 ${sym} E${strat.id} ${strat.name} — ejecutando ${strat.dir}…`, "success");
+        addLog(`🟢 ${sym} E${strat.id} ${strat.name} — señal confirmada, ejecutando ${strat.dir}…`, "success");
         try {
           // Nearest expiration
           const exps = await trGetExpirations(t, sym);
-          if (!exps.length) { addLog(`${sym}: sin vencimientos`, "error"); break; }
+          if (!exps.length) { addLog(`${sym}: sin vencimientos disponibles`, "error"); break; }
           const expDate = exps[0];
 
           // Options chain
           const chain = await trGetChain(t, sym, expDate);
           const optType = strat.dir === "CALL" ? "call" : "put";
           const filtered = chain.filter(o => o.option_type === optType && o.ask > 0);
-          if (!filtered.length) { addLog(`${sym}: cadena vacía`, "error"); break; }
+          if (!filtered.length) { addLog(`${sym}: cadena de opciones vacía`, "error"); break; }
 
           // Target strike by OTM %
-          const etNow   = getETNow();
-          const dow     = etNow.getDay();
-          const pct     = otmPctByDow(dow);
-          const rawTgt  = strat.dir === "CALL" ? data.price * (1 + pct) : data.price * (1 - pct);
-          const tgtStrike = Math.round(rawTgt * 2) / 2; // round to nearest $0.50
+          const etNow    = getETNow();
+          const dow      = etNow.getDay();
+          const otmPct   = otmPctByDow(dow);
+          const rawTgt   = strat.dir === "CALL" ? data.price * (1 + otmPct) : data.price * (1 - otmPct);
+          const tgtStrike = Math.round(rawTgt * 2) / 2;
 
           const closest = filtered.reduce((best, o) =>
             Math.abs(o.strike - tgtStrike) < Math.abs(best.strike - tgtStrike) ? o : best
@@ -1849,45 +1849,90 @@ function TabBot({ market, selectedTickers, apiKey }) {
           // Position size
           let bal;
           try { bal = await trGetBalance(t, aid); } catch { bal = null; }
-          const cash   = parseFloat(bal?.cash?.cash_available ?? bal?.total_cash ?? 100000);
-          const invest  = cash * (size / 100);
-          const qty    = Math.max(1, Math.floor(invest / (closest.ask * 100)));
-          const entry  = closest.ask;
+          const cash  = parseFloat(bal?.cash?.cash_available ?? bal?.total_cash ?? 100000);
+          const invest = cash * (size / 100);
+          const qty   = Math.max(1, Math.floor(invest / (closest.ask * 100)));
+          const entry = closest.ask;
 
-          // Buy to open
+          // ── STEP 1: Buy to open ──────────────────────────────────────────────
           await trPlaceOrder(t, aid, {
             symbol: sym, optionSymbol: closest.symbol,
             side: "buy_to_open", quantity: qty,
             price: entry.toFixed(2), duration: "day",
           });
-          addLog(`COMPRA ${qty}x ${closest.symbol} @ $${entry.toFixed(2)}`, "success");
 
-          // Sell to close GTC at target − $2 commission per contract
-          const targetPrice = Math.max(entry * (1 + planObj.pct) - (2 / (qty * 100)), entry + 0.01);
+          // ── STEP 2: Immediately place sell limit (same instant as buy) ───────
+          // Target = entry × plan_multiplier + $2 commission spread over contracts
+          const planMultiplier = planObj.pct === 1.00 ? 2.00 : (1 + planObj.pct);
+          const commPerUnit    = BT_COMM / (qty * 100);          // $2 spread over all units
+          const sellTarget     = parseFloat((entry * planMultiplier + commPerUnit).toFixed(2));
+
           await trPlaceOrder(t, aid, {
             symbol: sym, optionSymbol: closest.symbol,
             side: "sell_to_close", quantity: qty,
-            price: targetPrice.toFixed(2), duration: "gtc",
+            price: sellTarget.toFixed(2), duration: "gtc",
           });
-          addLog(`VENTA GTC @ $${targetPrice.toFixed(2)} (${(planObj.pct * 100).toFixed(0)}% objetivo)`, "info");
+
+          // ── Stop-loss metadata (monitored next cycle via positions check) ────
+          // Plan 10%: −20% max, cut at 15 min
+          // Plan 35%: −20% max, cut before 4:00pm ET
+          // Plan 100%: −20% max anytime
+          const stopPct    = 0.20;
+          const stopPrice  = parseFloat((entry * (1 - stopPct)).toFixed(2));
+          const planLabel  = planObj.label;
+
+          addLog(`✅ COMPRA ejecutada: ${sym} ${strat.dir} $${entry.toFixed(2)} — Venta limit colocada en $${sellTarget.toFixed(2)}`, "success");
+          addLog(`   ${qty} contrato${qty>1?"s":""} · Strike $${closest.strike} · Exp ${expDate} · Stop −20% @ $${stopPrice}`, "info");
+          addLog(`   ${planLabel}: objetivo +${(planObj.pct*100).toFixed(0)}% · ${planObj.pct===0.10?"cortar en 15min":planObj.pct===0.35?"cortar antes de 4:00pm":"cortar si −20%"}`, "info");
 
           // Record
           const rec = {
             id: Date.now(), date: new Date().toISOString(),
             sym, dir: strat.dir, stratId: strat.id, stratName: strat.name,
             optionSymbol: closest.symbol, strike: closest.strike,
-            expDate, qty, entry, target: parseFloat(targetPrice.toFixed(2)),
-            plan: plan, status: "ABIERTA",
+            expDate, qty, entry, target: sellTarget, stop: stopPrice,
+            plan: plan, planLabel, status: "ABIERTA",
           };
           setBotTrades(prev => { const n = [rec, ...prev]; save(LS_BOT_TRADES, n); return n; });
           playSignalAlert();
           await refreshAccount();
         } catch(e) {
-          addLog(`${sym} orden error: ${e.message}`, "error");
+          addLog(`${sym} error al ejecutar orden: ${e.message}`, "error");
         }
         break; // one strategy per ticker per cycle
       }
     }
+    // ── Stop-loss monitor: check open bot trades against current market ────────
+    const openTrades = load(LS_BOT_TRADES, []).filter(bt => bt.status === "ABIERTA");
+    const etNowCheck = getETNow();
+    const etMinutes  = etNowCheck.getHours() * 60 + etNowCheck.getMinutes();
+
+    for (const bt of openTrades) {
+      const liveData = mkt[bt.sym];
+      if (!liveData) continue;
+      const livePrice = liveData.price;
+
+      // Check if objective was hit (live price ≥ sell target for CALL, ≤ for PUT)
+      const objHit = bt.dir === "CALL" ? livePrice >= bt.target : livePrice <= bt.target;
+      // Check if stop was hit (live price ≤ stop for CALL, ≥ for PUT)
+      const stopHit = bt.dir === "CALL" ? livePrice <= bt.stop : livePrice >= bt.stop;
+      // Plan 10%: cut at 15 min (market open = 9:30 → cut at 9:45)
+      const plan10Cut = bt.plan === "p10" && etMinutes >= 9 * 60 + 45;
+      // Plan 35%: cut before 4:00pm (within 5 min of close)
+      const plan35Cut = bt.plan === "p35" && etMinutes >= 15 * 60 + 55;
+
+      if (objHit) {
+        addLog(`🎯 OBJETIVO ALCANZADO: +${((bt.target / bt.entry - 1) * 100).toFixed(0)}% ganancia — ${bt.sym} ${bt.dir}`, "success");
+        setBotTrades(prev => { const n = prev.map(x => x.id === bt.id ? { ...x, status: "GANANCIA" } : x); save(LS_BOT_TRADES, n); return n; });
+      } else if (stopHit) {
+        addLog(`🚫 STOP LOSS: −20% cortado — ${bt.sym} ${bt.dir} @ $${livePrice.toFixed(2)}`, "error");
+        setBotTrades(prev => { const n = prev.map(x => x.id === bt.id ? { ...x, status: "STOP" } : x); save(LS_BOT_TRADES, n); return n; });
+      } else if (plan10Cut || plan35Cut) {
+        addLog(`⏱ CORTE POR TIEMPO (${bt.planLabel}): ${bt.sym} ${bt.dir} @ $${livePrice.toFixed(2)}`, "warning");
+        setBotTrades(prev => { const n = prev.map(x => x.id === bt.id ? { ...x, status: "CORTADO" } : x); save(LS_BOT_TRADES, n); return n; });
+      }
+    }
+
     addLog("Ciclo completado");
   }, [addLog, refreshAccount]);
 
@@ -2051,8 +2096,22 @@ function TabBot({ market, selectedTickers, apiKey }) {
                   </span>
                 </div>
                 <div className="text-slate-500 text-xs font-mono mt-0.5 truncate">{t.optionSymbol}</div>
-                <div className="flex justify-between text-xs mt-1">
-                  <span className="text-slate-500">${t.entry?.toFixed(2)} × {t.qty} → objetivo ${t.target?.toFixed(2)}</span>
+                <div className="grid grid-cols-3 gap-1 mt-1.5 text-xs">
+                  <div className="bg-slate-700/40 rounded px-1.5 py-1 text-center">
+                    <div className="text-slate-600 leading-none mb-0.5">Compra</div>
+                    <div className="text-white font-mono">${t.entry?.toFixed(2)}</div>
+                  </div>
+                  <div className="bg-green-900/30 rounded px-1.5 py-1 text-center">
+                    <div className="text-slate-600 leading-none mb-0.5">🎯 Venta</div>
+                    <div className="text-green-400 font-mono">${t.target?.toFixed(2)}</div>
+                  </div>
+                  <div className="bg-red-900/30 rounded px-1.5 py-1 text-center">
+                    <div className="text-slate-600 leading-none mb-0.5">🚫 Stop</div>
+                    <div className="text-red-400 font-mono">${t.stop?.toFixed(2)}</div>
+                  </div>
+                </div>
+                <div className="flex justify-between mt-1 text-xs">
+                  <span className="text-slate-600">{t.planLabel ?? t.plan} · {t.qty} contrato{t.qty>1?"s":""}</span>
                   <span className="text-slate-600">{t.date ? new Date(t.date).toLocaleDateString() : ""}</span>
                 </div>
               </div>
