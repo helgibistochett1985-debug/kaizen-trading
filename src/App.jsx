@@ -2147,11 +2147,17 @@ function TabBot({ market, selectedTickers, apiKey }) {
 // ═══════════════════════════════════════════════════════════════════════════════
 const BT_CAPITAL  = 10000;  // virtual starting capital
 const BT_POS_PCT  = 0.05;   // 5 % of equity per trade
-const BT_WIN_PCT  = 0.35;   // Plan 35 %
-const BT_LOSS_PCT = 0.15;   // stop −15 %
+const BT_WIN_PCT  = 0.35;   // Plan 35 % profit target
+const BT_LOSS_PCT = 0.20;   // stop −20 %
 const BT_COMM     = 2;      // $2 commission per round-trip
-const BT_WIN_MOVE = 0.015;  // +1.5 % underlying → option WIN
-const BT_LOS_MOVE = 0.025;  // −2.5 % underlying → option LOSS
+// Underlying moves that trigger option WIN/LOSS (both directions):
+//   CALL WIN  : stock HIGH   rises  ≥ BT_WIN_MOVE  from entry
+//   CALL LOSS : stock LOW    drops  ≥ BT_LOS_MOVE  from entry
+//   PUT  WIN  : stock LOW    drops  ≥ BT_WIN_MOVE  from entry
+//   PUT  LOSS : stock HIGH   rises  ≥ BT_LOS_MOVE  from entry
+const BT_WIN_MOVE = 0.025;  // 2.5 % → approx 35 % option gain (3x leverage)
+const BT_LOS_MOVE = 0.020;  // 2.0 % → approx −20 % option loss
+const BT_LEVERAGE = 3.5;    // leverage for NEUTRAL P&L calculation
 const BT_SYMS     = ["TSLA", "GOOGL", "MSFT", "META"];
 
 async function fetchHistoricalBars(sym, apiKey, attempt = 0) {
@@ -2165,6 +2171,24 @@ async function fetchHistoricalBars(sym, apiKey, attempt = 0) {
   catch { throw new Error(`Red — ${sym}`); }
   if (res.status === 429) {
     if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetchHistoricalBars(sym, apiKey, attempt+1); }
+    throw new Error(`429 — ${sym}`);
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status} — ${sym}`);
+  return (await res.json()).results || [];
+}
+
+// Hourly bars for the 3-month window — used for intraday WIN/LOSS detection
+async function fetchHourlyBars(sym, apiKey, attempt = 0) {
+  const to   = new Date();
+  const from = new Date(); from.setMonth(from.getMonth() - 3);
+  const url  = `https://api.polygon.io/v2/aggs/ticker/${sym}/range/1/hour/`
+    + `${from.toISOString().split("T")[0]}/${to.toISOString().split("T")[0]}`
+    + `?adjusted=true&sort=asc&limit=5000&apiKey=${apiKey}`;
+  let res;
+  try { res = await fetch(url); }
+  catch { throw new Error(`Red — ${sym}`); }
+  if (res.status === 429) {
+    if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetchHourlyBars(sym, apiKey, attempt+1); }
     throw new Error(`429 — ${sym}`);
   }
   if (!res.ok) throw new Error(`HTTP ${res.status} — ${sym}`);
@@ -2208,12 +2232,16 @@ function getAutoCondIds(strat) {
   return [...global, ...specific];
 }
 
-function runBacktest(historicalData) {
+// runBacktest(dailyData, hourlyData)
+// dailyData  — 7-month daily bars per symbol  (signal detection + MA/BB warmup)
+// hourlyData — 3-month hourly bars per symbol (intraday WIN/LOSS detection)
+function runBacktest(dailyData, hourlyData) {
   const cutoff = new Date(); cutoff.setMonth(cutoff.getMonth() - 3);
   const rawTrades = [];
 
   for (const sym of BT_SYMS) {
-    const bars = historicalData[sym];
+    const bars  = dailyData[sym];
+    const hBars = hourlyData[sym] || []; // may be empty — falls back to daily H/L
     if (!bars || bars.length < 55) continue;
 
     for (let i = 50; i < bars.length - 2; i++) {
@@ -2227,9 +2255,10 @@ function runBacktest(historicalData) {
 
       const dateStr = barDate.toISOString().split("T")[0];
 
+      // Try every strategy — both CALL and PUT must be evaluated independently
       for (const strat of STRATS) {
-        const condIds  = getAutoCondIds(strat);
-        const autoRes  = evalAuto(data, strat);
+        const condIds = getAutoCondIds(strat);
+        const autoRes = evalAuto(data, strat);
         if (!condIds.every(id => autoRes[id]?.ok)) continue;
 
         // Signal confirmed → enter at next day's open
@@ -2238,35 +2267,43 @@ function runBacktest(historicalData) {
         const entry = nextBar.o;
 
         const dte = dow >= 1 && dow <= 5 ? DTES[dow - 1] : 3;
-        const lookahead = bars.slice(i + 1, i + 1 + dte + 2);
 
-        let outcome  = "NEUTRAL";
-        let exitPrice = nextBar.c;
-        let exitDate  = new Date(nextBar.t).toISOString().split("T")[0];
+        // ── Build the intraday simulation bars ──────────────────────────────
+        // Prefer hourly bars if available (better precision); fall back to daily H/L
+        const entryTs  = nextBar.t;
+        const expiryTs = entryTs + (dte + 1) * 24 * 60 * 60 * 1000;
+        const simBars  = hBars.filter(b => b.t >= entryTs && b.t <= expiryTs).length > 0
+          ? hBars.filter(b => b.t >= entryTs && b.t <= expiryTs)
+          : bars.slice(i + 1, i + 1 + dte + 2); // daily fallback
 
-        for (const lb of lookahead) {
+        let outcome   = "NEUTRAL";
+        let exitPrice = nextBar.c; // default: close of entry day
+
+        for (const sb of simBars) {
+          // CALL: WIN when stock goes UP enough, LOSS when it falls enough
+          // PUT:  WIN when stock goes DOWN enough, LOSS when it rises enough
           if (strat.dir === "CALL") {
-            if (lb.high / entry - 1 >= BT_WIN_MOVE)  { outcome = "WIN";  exitPrice = entry*(1+BT_WIN_MOVE); exitDate = new Date(lb.t).toISOString().split("T")[0]; break; }
-            if (1 - lb.low  / entry >= BT_LOS_MOVE)  { outcome = "LOSS"; exitPrice = entry*(1-BT_LOS_MOVE); exitDate = new Date(lb.t).toISOString().split("T")[0]; break; }
-          } else {
-            if (1 - lb.low  / entry >= BT_WIN_MOVE)  { outcome = "WIN";  exitPrice = entry*(1-BT_WIN_MOVE); exitDate = new Date(lb.t).toISOString().split("T")[0]; break; }
-            if (lb.high / entry - 1 >= BT_LOS_MOVE)  { outcome = "LOSS"; exitPrice = entry*(1+BT_LOS_MOVE); exitDate = new Date(lb.t).toISOString().split("T")[0]; break; }
+            if (sb.high / entry - 1 >= BT_WIN_MOVE) { outcome = "WIN";  exitPrice = entry * (1 + BT_WIN_MOVE); break; }
+            if (1 - sb.low  / entry >= BT_LOS_MOVE) { outcome = "LOSS"; exitPrice = entry * (1 - BT_LOS_MOVE); break; }
+          } else { // PUT
+            if (1 - sb.low  / entry >= BT_WIN_MOVE) { outcome = "WIN";  exitPrice = entry * (1 - BT_WIN_MOVE); break; }
+            if (sb.high / entry - 1 >= BT_LOS_MOVE) { outcome = "LOSS"; exitPrice = entry * (1 + BT_LOS_MOVE); break; }
           }
-          exitPrice = lb.c;
-          exitDate  = new Date(lb.t).toISOString().split("T")[0];
+          exitPrice = sb.c; // track last close for NEUTRAL P&L
         }
 
         rawTrades.push({
           id: `${sym}_s${strat.id}_${dateStr}`,
           date: dateStr, sym, stratId: strat.id, stratName: strat.name,
-          dir: strat.dir, entry, exitPrice, exitDate, outcome,
+          dir: strat.dir, entry, exitPrice, outcome,
+          exitDate: new Date(expiryTs).toISOString().split("T")[0],
         });
-        break; // one strategy per bar per ticker
+        break; // one strategy per bar per ticker (first match wins)
       }
     }
   }
 
-  // Sort chronologically, compute equity curve
+  // Sort chronologically; compute equity curve
   rawTrades.sort((a, b) => a.date.localeCompare(b.date));
 
   let equity = BT_CAPITAL;
@@ -2274,11 +2311,24 @@ function runBacktest(historicalData) {
 
   for (const t of rawTrades) {
     const invest = equity * BT_POS_PCT;
-    t.pnl = t.outcome === "WIN"
-      ?  invest * BT_WIN_PCT  - BT_COMM
-      : t.outcome === "LOSS"
-      ? -(invest * BT_LOSS_PCT) - BT_COMM
-      : -(invest * 0.05) - BT_COMM;    // neutral: ~time decay
+
+    if (t.outcome === "WIN") {
+      t.pnl = invest * BT_WIN_PCT - BT_COMM;
+
+    } else if (t.outcome === "LOSS") {
+      t.pnl = -(invest * BT_LOSS_PCT) - BT_COMM;
+
+    } else {
+      // NEUTRAL: price didn't hit either threshold within DTE.
+      // Calculate the actual directional move and apply leverage.
+      // CALL: profit if stock went up; PUT: profit if stock went down.
+      const dirMove = t.dir === "CALL"
+        ? (t.exitPrice - t.entry) / t.entry
+        : (t.entry - t.exitPrice) / t.entry;
+      const optReturn = Math.max(-BT_LOSS_PCT, Math.min(BT_WIN_PCT, dirMove * BT_LEVERAGE));
+      t.pnl = invest * optReturn - BT_COMM;
+    }
+
     equity += t.pnl;
     curve.push({ date: t.date, equity });
   }
@@ -2300,13 +2350,22 @@ function runBacktest(historicalData) {
     };
   });
 
+  // CALL vs PUT breakdown
+  const callTrades = rawTrades.filter(t => t.dir === "CALL");
+  const putTrades  = rawTrades.filter(t => t.dir === "PUT");
+  const callWins   = callTrades.filter(t => t.outcome === "WIN").length;
+  const putWins    = putTrades.filter(t => t.outcome === "WIN").length;
+  const callPnl    = callTrades.reduce((s,t) => s + (t.pnl??0), 0);
+  const putPnl     = putTrades.reduce((s,t)  => s + (t.pnl??0), 0);
+
   const totalWins = rawTrades.filter(t => t.outcome === "WIN").length;
   return {
     trades: rawTrades, curve, stratSums, equity,
-    totalTrades: rawTrades.length,
-    totalWins,
+    totalTrades: rawTrades.length, totalWins,
     winRate: rawTrades.length ? totalWins / rawTrades.length * 100 : 0,
     totalPnl: equity - BT_CAPITAL,
+    callTrades: callTrades.length, callWins, callPnl,
+    putTrades:  putTrades.length,  putWins,  putPnl,
   };
 }
 
@@ -2383,22 +2442,29 @@ function TabBacktest({ apiKey }) {
   const run = async () => {
     if (!apiKey) { setError("Necesitas configurar la API key de Polygon primero"); return; }
     setRunning(true); setError(null); setResults(null);
-    const hist = {};
+    const daily  = {};
+    const hourly = {};
+    // All API calls: 4 daily + 4 hourly = 8 total; 15s between each
+    const allFetches = [
+      ...BT_SYMS.map(sym => ({ sym, type: "daily"  })),
+      ...BT_SYMS.map(sym => ({ sym, type: "hourly" })),
+    ];
     try {
-      for (let i = 0; i < BT_SYMS.length; i++) {
-        const sym = BT_SYMS[i];
-        setProgress(`Descargando ${sym} (${i+1}/${BT_SYMS.length})…`);
-        hist[sym] = await fetchHistoricalBars(sym, apiKey);
-        if (i < BT_SYMS.length - 1) {
+      for (let i = 0; i < allFetches.length; i++) {
+        const { sym, type } = allFetches[i];
+        setProgress(`${type === "daily" ? "Diario" : "Intradía 1h"} ${sym} (${i+1}/${allFetches.length})…`);
+        if (type === "daily")  daily[sym]  = await fetchHistoricalBars(sym, apiKey);
+        else                   hourly[sym] = await fetchHourlyBars(sym, apiKey);
+        if (i < allFetches.length - 1) {
           for (let s = 15; s >= 1; s--) {
-            setProgress(`Esperando ${s}s para respetar límite API…`);
+            setProgress(`Esperando ${s}s — límite API… (${i+1}/${allFetches.length})`);
             await new Promise(r => setTimeout(r, 1000));
           }
         }
       }
-      setProgress("Simulando 8 estrategias × 3 meses…");
+      setProgress("Simulando 8 estrategias × 3 meses (CALL + PUT)…");
       await new Promise(r => setTimeout(r, 50));
-      setResults(runBacktest(hist));
+      setResults(runBacktest(daily, hourly));
     } catch(e) { setError(e.message); }
     setProgress(""); setRunning(false);
   };
@@ -2427,10 +2493,10 @@ function TabBacktest({ apiKey }) {
       {/* Methodology note */}
       <div className="bg-slate-800/60 border border-slate-700/40 rounded-xl px-3 py-2.5 space-y-0.5">
         <div className="text-slate-300 text-xs font-semibold mb-1">Metodología</div>
-        <div className="text-slate-500 text-xs">• TSLA · GOOGL · MSFT · META — últimos 3 meses de datos diarios</div>
-        <div className="text-slate-500 text-xs">• Solo condiciones auto (BB, MA, GAP, Vol) — manuales asumidas ✓</div>
-        <div className="text-slate-500 text-xs">• Capital $10,000 · 5 % por trade · Plan 35 % / Stop −15 %</div>
-        <div className="text-slate-500 text-xs">• WIN si underlying mueve ≥1.5 % · LOSS si mueve ≥2.5 % en contra · DTE por weekday</div>
+        <div className="text-slate-500 text-xs">• TSLA · GOOGL · MSFT · META — señales en datos diarios (7m) + simulación en barras 1h (3m)</div>
+        <div className="text-slate-500 text-xs">• CALL gana si precio SUBE ≥2.5 % · PUT gana si precio BAJA ≥2.5 % — ambas direcciones válidas</div>
+        <div className="text-slate-500 text-xs">• Capital $10,000 · 5 % por trade · Plan 35 % objetivo / Stop −20 %</div>
+        <div className="text-slate-500 text-xs">• Neutros: P&L real según movimiento final × 3.5x leverage (sin penalización fija)</div>
       </div>
 
       {/* Progress */}
@@ -2461,6 +2527,48 @@ function TabBacktest({ apiKey }) {
                 <div className={`font-bold text-xl ${cls}`}>{val}</div>
               </div>
             ))}
+          </div>
+
+          {/* CALL vs PUT breakdown */}
+          <div className="bg-slate-800 rounded-2xl p-3 border border-slate-700/60">
+            <div className="text-slate-400 text-xs font-bold mb-2 uppercase tracking-wider">CALL vs PUT</div>
+            <div className="grid grid-cols-3 gap-2 text-xs">
+              {[
+                {
+                  label: "🟢 CALL",
+                  trades: results.callTrades,
+                  wins:   results.callWins,
+                  pnl:    results.callPnl,
+                  color:  results.callPnl >= 0 ? "text-green-400" : "text-red-400",
+                  border: "border-green-900/40",
+                },
+                {
+                  label: "🔴 PUT",
+                  trades: results.putTrades,
+                  wins:   results.putWins,
+                  pnl:    results.putPnl,
+                  color:  results.putPnl >= 0 ? "text-green-400" : "text-red-400",
+                  border: "border-red-900/40",
+                },
+                {
+                  label: "⚖️ Total",
+                  trades: results.totalTrades,
+                  wins:   results.totalWins,
+                  pnl:    results.totalPnl,
+                  color:  results.totalPnl >= 0 ? "text-green-400" : "text-red-400",
+                  border: "border-slate-600/40",
+                },
+              ].map(row => (
+                <div key={row.label} className={`bg-slate-700/40 rounded-xl px-2.5 py-2.5 border ${row.border}`}>
+                  <div className="text-slate-300 font-bold text-xs mb-1">{row.label}</div>
+                  <div className="text-slate-400">{row.trades} trades</div>
+                  <div className="text-slate-400">{row.trades ? (row.wins/row.trades*100).toFixed(0) : 0}% win</div>
+                  <div className={`font-bold mt-1 ${row.color}`}>
+                    {row.pnl>=0?"+":""}${Math.round(row.pnl)}
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
 
           {/* Equity curve */}
