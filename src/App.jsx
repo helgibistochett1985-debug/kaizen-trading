@@ -25,7 +25,7 @@ const SYMS       = TICKERS.map(t => t.sym);
 const TICKER_MAP = Object.fromEntries(TICKERS.map(t => [t.sym, t]));
 
 // ─── App constants ────────────────────────────────────────────────────────────
-const TABS  = ["Mercado", "Señal", "Check", "Calc", "Trades", "Bot", "Ref"];
+const TABS  = ["Mercado", "Señal", "Check", "Calc", "Trades", "Bot", "BTest", "Ref"];
 const PLANS = [
   { id:"p10",  label:"Plan 10%",  pct:0.10, from:"from-blue-700",   to:"to-blue-500"   },
   { id:"p35",  label:"Plan 35%",  pct:0.35, from:"from-purple-700", to:"to-purple-500" },
@@ -2085,6 +2085,494 @@ function TabBot({ market, selectedTickers, apiKey }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// BACKTEST ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
+const BT_CAPITAL  = 10000;  // virtual starting capital
+const BT_POS_PCT  = 0.05;   // 5 % of equity per trade
+const BT_WIN_PCT  = 0.35;   // Plan 35 %
+const BT_LOSS_PCT = 0.15;   // stop −15 %
+const BT_COMM     = 2;      // $2 commission per round-trip
+const BT_WIN_MOVE = 0.015;  // +1.5 % underlying → option WIN
+const BT_LOS_MOVE = 0.025;  // −2.5 % underlying → option LOSS
+const BT_SYMS     = ["TSLA", "GOOGL", "QQQ"];
+
+async function fetchHistoricalBars(sym, apiKey, attempt = 0) {
+  const to   = new Date();
+  const from = new Date(); from.setMonth(from.getMonth() - 7);
+  const url  = `https://api.polygon.io/v2/aggs/ticker/${sym}/range/1/day/`
+    + `${from.toISOString().split("T")[0]}/${to.toISOString().split("T")[0]}`
+    + `?adjusted=true&sort=asc&limit=200&apiKey=${apiKey}`;
+  let res;
+  try { res = await fetch(url); }
+  catch { throw new Error(`Red — ${sym}`); }
+  if (res.status === 429) {
+    if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetchHistoricalBars(sym, apiKey, attempt+1); }
+    throw new Error(`429 — ${sym}`);
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status} — ${sym}`);
+  return (await res.json()).results || [];
+}
+
+function buildDayDataBT(sym, bars, idx) {
+  if (idx < 50) return null;
+  const slice  = bars.slice(0, idx + 1);
+  const closes = slice.map(b => b.c);
+  const vols   = slice.map(b => b.v);
+  const last   = slice[slice.length - 1];
+  const prev   = slice[slice.length - 2];
+  const BB     = calcBB(closes);
+  const BBprev = calcBB(closes.slice(0, -1));
+  const ma20   = sma(closes, 20);
+  const ma40   = sma(closes, 40);
+  const ma50   = sma(closes, 50);
+  if (!BB || !ma20 || !ma40) return null;
+  const avgVol   = vols.slice(-20).reduce((a,b) => a+b, 0) / Math.min(20, vols.length);
+  const volLevel = BB.width < 3 ? "BAJA" : BB.width < 8 ? "ALTA" : "EXTREMA";
+  return {
+    sym, price: last.c, open: last.o, high: last.h, low: last.l, volume: last.v,
+    change: last.c - (prev?.c ?? last.c),
+    changePct: prev ? (last.c - prev.c) / prev.c * 100 : 0,
+    bb: BB, ma20, ma40, ma50, signal: calcSignal(last.c, BB, ma20, ma50),
+    gap: detectGap(slice.slice(-2)), bars: slice, avgVolume: avgVol,
+    prevLowVol: BBprev ? BBprev.width < 3 : false, volLevel,
+  };
+}
+
+// Returns auto-evaluatable condition IDs for a strategy (skips manual + gapTime)
+function getAutoCondIds(strat) {
+  const global = [
+    ...(strat.noHighVolRequired ? [] : ["vol"]),
+    "bbDir", "ma20Dir", "ma40Dir", "volume",
+  ];
+  const specific = strat.specific
+    .filter(c => c.type === "auto" && c.id !== "gapTime")
+    .map(c => c.id);
+  return [...global, ...specific];
+}
+
+function runBacktest(historicalData) {
+  const cutoff = new Date(); cutoff.setMonth(cutoff.getMonth() - 3);
+  const rawTrades = [];
+
+  for (const sym of BT_SYMS) {
+    const bars = historicalData[sym];
+    if (!bars || bars.length < 55) continue;
+
+    for (let i = 50; i < bars.length - 2; i++) {
+      const barDate = new Date(bars[i].t);
+      if (barDate < cutoff) continue;
+      const dow = barDate.getDay();
+      if (dow === 0 || dow === 6) continue;
+
+      const data = buildDayDataBT(sym, bars, i);
+      if (!data || data.volLevel === "BAJA") continue;
+
+      const dateStr = barDate.toISOString().split("T")[0];
+
+      for (const strat of STRATS) {
+        const condIds  = getAutoCondIds(strat);
+        const autoRes  = evalAuto(data, strat);
+        if (!condIds.every(id => autoRes[id]?.ok)) continue;
+
+        // Signal confirmed → enter at next day's open
+        const nextBar = bars[i + 1];
+        if (!nextBar) continue;
+        const entry = nextBar.o;
+
+        const dte = dow >= 1 && dow <= 5 ? DTES[dow - 1] : 3;
+        const lookahead = bars.slice(i + 1, i + 1 + dte + 2);
+
+        let outcome  = "NEUTRAL";
+        let exitPrice = nextBar.c;
+        let exitDate  = new Date(nextBar.t).toISOString().split("T")[0];
+
+        for (const lb of lookahead) {
+          if (strat.dir === "CALL") {
+            if (lb.high / entry - 1 >= BT_WIN_MOVE)  { outcome = "WIN";  exitPrice = entry*(1+BT_WIN_MOVE); exitDate = new Date(lb.t).toISOString().split("T")[0]; break; }
+            if (1 - lb.low  / entry >= BT_LOS_MOVE)  { outcome = "LOSS"; exitPrice = entry*(1-BT_LOS_MOVE); exitDate = new Date(lb.t).toISOString().split("T")[0]; break; }
+          } else {
+            if (1 - lb.low  / entry >= BT_WIN_MOVE)  { outcome = "WIN";  exitPrice = entry*(1-BT_WIN_MOVE); exitDate = new Date(lb.t).toISOString().split("T")[0]; break; }
+            if (lb.high / entry - 1 >= BT_LOS_MOVE)  { outcome = "LOSS"; exitPrice = entry*(1+BT_LOS_MOVE); exitDate = new Date(lb.t).toISOString().split("T")[0]; break; }
+          }
+          exitPrice = lb.c;
+          exitDate  = new Date(lb.t).toISOString().split("T")[0];
+        }
+
+        rawTrades.push({
+          id: `${sym}_s${strat.id}_${dateStr}`,
+          date: dateStr, sym, stratId: strat.id, stratName: strat.name,
+          dir: strat.dir, entry, exitPrice, exitDate, outcome,
+        });
+        break; // one strategy per bar per ticker
+      }
+    }
+  }
+
+  // Sort chronologically, compute equity curve
+  rawTrades.sort((a, b) => a.date.localeCompare(b.date));
+
+  let equity = BT_CAPITAL;
+  const curve = [{ date: "Inicio", equity: BT_CAPITAL }];
+
+  for (const t of rawTrades) {
+    const invest = equity * BT_POS_PCT;
+    t.pnl = t.outcome === "WIN"
+      ?  invest * BT_WIN_PCT  - BT_COMM
+      : t.outcome === "LOSS"
+      ? -(invest * BT_LOSS_PCT) - BT_COMM
+      : -(invest * 0.05) - BT_COMM;    // neutral: ~time decay
+    equity += t.pnl;
+    curve.push({ date: t.date, equity });
+  }
+
+  // Per-strategy summaries
+  const stratSums = STRATS.map(s => {
+    const st    = rawTrades.filter(t => t.stratId === s.id);
+    const wins  = st.filter(t => t.outcome === "WIN");
+    const pnls  = st.map(t => t.pnl ?? 0);
+    const tot   = pnls.reduce((a,b) => a+b, 0);
+    const best  = st.length ? st.reduce((b,t) => (t.pnl??-Infinity) > (b.pnl??-Infinity) ? t : b) : null;
+    const worst = st.length ? st.reduce((w,t) => (t.pnl??Infinity)  < (w.pnl??Infinity)  ? t : w) : null;
+    return {
+      id: s.id, name: s.name, dir: s.dir,
+      fires: st.length, wins: wins.length,
+      winPct: st.length ? wins.length / st.length * 100 : 0,
+      avgPnl: st.length ? tot / st.length : 0,
+      totalPnl: tot, best, worst,
+    };
+  });
+
+  const totalWins = rawTrades.filter(t => t.outcome === "WIN").length;
+  return {
+    trades: rawTrades, curve, stratSums, equity,
+    totalTrades: rawTrades.length,
+    totalWins,
+    winRate: rawTrades.length ? totalWins / rawTrades.length * 100 : 0,
+    totalPnl: equity - BT_CAPITAL,
+  };
+}
+
+// ─── Equity curve SVG ─────────────────────────────────────────────────────────
+function EquityChart({ curve }) {
+  if (!curve || curve.length < 2) return null;
+  const W=300, H=140, PX=38, PY=14;
+  const iW=W-PX*2, iH=H-PY*2;
+  const vals  = curve.map(p => p.equity);
+  const minV  = Math.min(...vals);
+  const maxV  = Math.max(...vals);
+  const range = maxV - minV || 1;
+  const px = i => PX + (i / (curve.length-1)) * iW;
+  const py = v => PY + iH - ((v - minV) / range) * iH;
+  const pts     = curve.map((p,i) => `${px(i).toFixed(1)},${py(p.equity).toFixed(1)}`).join(" ");
+  const areaPts = `${px(0)},${PY+iH} ${pts} ${px(curve.length-1)},${PY+iH}`;
+  const isUp  = curve[curve.length-1].equity >= BT_CAPITAL;
+  const color = isUp ? "#22c55e" : "#ef4444";
+  const pctChg = (curve[curve.length-1].equity - BT_CAPITAL) / BT_CAPITAL * 100;
+
+  return (
+    <div className="bg-slate-900 rounded-xl overflow-hidden">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{height:140}}>
+        <defs>
+          <linearGradient id="ecGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%"   stopColor={color} stopOpacity="0.28"/>
+            <stop offset="100%" stopColor={color} stopOpacity="0.02"/>
+          </linearGradient>
+        </defs>
+        {[0,0.33,0.67,1].map((p,i) => {
+          const yy = PY + iH*(1-p);
+          return (
+            <g key={i}>
+              <line x1={PX} x2={W-PX} y1={yy} y2={yy} stroke="#1e293b" strokeWidth="1"/>
+              <text x={PX-3} y={yy+3} textAnchor="end" fill="#475569" fontSize="8">
+                ${Math.round((minV+range*p)/100)*100}
+              </text>
+            </g>
+          );
+        })}
+        {/* start capital reference */}
+        <line x1={PX} x2={W-PX} y1={py(BT_CAPITAL)} y2={py(BT_CAPITAL)}
+          stroke="#334155" strokeWidth="1" strokeDasharray="4,2"/>
+        <polygon points={areaPts} fill="url(#ecGrad)"/>
+        <polyline points={pts} fill="none" stroke={color} strokeWidth="2"
+          strokeLinecap="round" strokeLinejoin="round"/>
+        <circle cx={px(0)} cy={py(curve[0].equity)} r="3" fill={color} opacity="0.6"/>
+        <circle cx={px(curve.length-1)} cy={py(curve[curve.length-1].equity)} r="3.5" fill={color}/>
+      </svg>
+      <div className="flex justify-between text-xs px-3 pb-2 mt-0.5">
+        <span className="text-slate-600">{curve[1]?.date ?? ""}</span>
+        <span className={`font-bold ${isUp?"text-green-400":"text-red-400"}`}>
+          {isUp?"+":""}{pctChg.toFixed(1)}% → ${Math.round(curve[curve.length-1].equity).toLocaleString()}
+        </span>
+        <span className="text-slate-600">{curve[curve.length-1].date}</span>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TAB: BACKTEST
+// ═══════════════════════════════════════════════════════════════════════════════
+function TabBacktest({ apiKey }) {
+  const [running,       setRunning]       = useState(false);
+  const [progress,      setProgress]      = useState("");
+  const [results,       setResults]       = useState(null);
+  const [error,         setError]         = useState(null);
+  const [filterSym,     setFilterSym]     = useState("all");
+  const [filterStrat,   setFilterStrat]   = useState("all");
+  const [filterOutcome, setFilterOutcome] = useState("all");
+  const [showTrades,    setShowTrades]    = useState(false);
+
+  const run = async () => {
+    if (!apiKey) { setError("Necesitas configurar la API key de Polygon primero"); return; }
+    setRunning(true); setError(null); setResults(null);
+    const hist = {};
+    try {
+      for (let i = 0; i < BT_SYMS.length; i++) {
+        const sym = BT_SYMS[i];
+        setProgress(`Descargando ${sym} (${i+1}/${BT_SYMS.length})…`);
+        hist[sym] = await fetchHistoricalBars(sym, apiKey);
+        if (i < BT_SYMS.length - 1) {
+          for (let s = 15; s >= 1; s--) {
+            setProgress(`Esperando ${s}s para respetar límite API…`);
+            await new Promise(r => setTimeout(r, 1000));
+          }
+        }
+      }
+      setProgress("Simulando 8 estrategias × 3 meses…");
+      await new Promise(r => setTimeout(r, 50));
+      setResults(runBacktest(hist));
+    } catch(e) { setError(e.message); }
+    setProgress(""); setRunning(false);
+  };
+
+  const filteredTrades = results?.trades.filter(t => {
+    if (filterSym     !== "all" && t.sym              !== filterSym)         return false;
+    if (filterStrat   !== "all" && String(t.stratId)  !== filterStrat)       return false;
+    if (filterOutcome !== "all" && t.outcome           !== filterOutcome)     return false;
+    return true;
+  }) ?? [];
+
+  return (
+    <div className="space-y-3">
+      {/* Header */}
+      <div className="flex justify-between items-center">
+        <h2 className="text-white font-bold">Backtest — Últimos 3 Meses</h2>
+        <button onClick={run} disabled={running || !apiKey}
+          className="bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white text-xs font-bold px-4 py-2 rounded-xl transition-all flex items-center gap-1.5">
+          <span className={running ? "animate-spin inline-block" : ""}>
+            {running ? "⟳" : "▶"}
+          </span>
+          {running ? "Ejecutando…" : "Ejecutar Backtest"}
+        </button>
+      </div>
+
+      {/* Methodology note */}
+      <div className="bg-slate-800/60 border border-slate-700/40 rounded-xl px-3 py-2.5 space-y-0.5">
+        <div className="text-slate-300 text-xs font-semibold mb-1">Metodología</div>
+        <div className="text-slate-500 text-xs">• TSLA · GOOGL · QQQ — últimos 3 meses de datos diarios</div>
+        <div className="text-slate-500 text-xs">• Solo condiciones auto (BB, MA, GAP, Vol) — manuales asumidas ✓</div>
+        <div className="text-slate-500 text-xs">• Capital $10,000 · 5 % por trade · Plan 35 % / Stop −15 %</div>
+        <div className="text-slate-500 text-xs">• WIN si underlying mueve ≥1.5 % · LOSS si mueve ≥2.5 % en contra · DTE por weekday</div>
+      </div>
+
+      {/* Progress */}
+      {running && (
+        <div className="bg-purple-950 border border-purple-800 rounded-xl px-3 py-2.5 text-xs text-purple-300 font-semibold animate-pulse">
+          ⟳ {progress}
+        </div>
+      )}
+
+      {error && (
+        <div className="bg-red-950 border border-red-800 rounded-xl px-3 py-2.5 text-xs text-red-300">
+          ✗ {error}
+        </div>
+      )}
+
+      {results && (
+        <>
+          {/* Summary cards */}
+          <div className="grid grid-cols-2 gap-2">
+            {[
+              ["Trades totales",  results.totalTrades,                                      "text-white"],
+              ["Tasa de acierto", results.totalTrades ? results.winRate.toFixed(1)+"%" : "—", results.winRate >= 50 ? "text-green-400" : "text-red-400"],
+              ["Capital final",   `$${Math.round(results.equity).toLocaleString()}`,          results.equity >= BT_CAPITAL ? "text-green-400" : "text-red-400"],
+              ["P&L total",       `${results.totalPnl>=0?"+":""}$${Math.round(results.totalPnl)}`, results.totalPnl >= 0 ? "text-green-400" : "text-red-400"],
+            ].map(([lbl,val,cls]) => (
+              <div key={lbl} className="bg-slate-800 rounded-xl px-3 py-3 text-center border border-slate-700/40">
+                <div className="text-slate-500 text-xs mb-0.5">{lbl}</div>
+                <div className={`font-bold text-xl ${cls}`}>{val}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Equity curve */}
+          <div className="bg-slate-800 rounded-2xl p-3 border border-slate-700/60">
+            <div className="text-slate-400 text-xs font-bold mb-2 uppercase tracking-wider">Curva de Equity</div>
+            <EquityChart curve={results.curve}/>
+          </div>
+
+          {/* Strategy summary table */}
+          <div className="bg-slate-800 rounded-2xl border border-slate-700/60 overflow-hidden">
+            <div className="px-4 py-3 border-b border-slate-700/40">
+              <div className="text-slate-300 font-semibold text-sm">Resumen por Estrategia</div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b border-slate-700/40 text-slate-500">
+                    <th className="text-left px-3 py-2 font-semibold">Estrategia</th>
+                    <th className="text-center px-2 py-2 font-semibold">Señales</th>
+                    <th className="text-center px-2 py-2 font-semibold">Éxito</th>
+                    <th className="text-center px-2 py-2 font-semibold">Avg $</th>
+                    <th className="text-right px-3 py-2 font-semibold">P&L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {results.stratSums.map(s => (
+                    <tr key={s.id} className="border-b border-slate-700/20 last:border-0">
+                      <td className="px-3 py-2.5">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-slate-400 font-bold">E{s.id}</span>
+                          <span className={`text-xs px-1 py-0.5 rounded font-bold
+                            ${s.dir==="CALL"?"bg-green-900/50 text-green-400":"bg-red-900/50 text-red-400"}`}>
+                            {s.dir}
+                          </span>
+                        </div>
+                        <div className="text-slate-600 text-xs truncate" style={{maxWidth:110}}>{s.name}</div>
+                      </td>
+                      <td className="text-center px-2 py-2.5">
+                        {s.fires > 0 ? (
+                          <>
+                            <div className="text-white font-bold">{s.fires}</div>
+                            <div className="text-slate-600">{s.wins}W·{s.fires-s.wins}L</div>
+                          </>
+                        ) : <span className="text-slate-700">—</span>}
+                      </td>
+                      <td className="text-center px-2 py-2.5">
+                        {s.fires > 0 ? (
+                          <span className={`font-bold text-sm
+                            ${s.winPct>=55?"text-green-400":s.winPct>=45?"text-yellow-400":"text-red-400"}`}>
+                            {s.winPct.toFixed(0)}%
+                          </span>
+                        ) : <span className="text-slate-700">—</span>}
+                      </td>
+                      <td className="text-center px-2 py-2.5">
+                        {s.fires > 0 ? (
+                          <span className={`font-bold ${s.avgPnl>=0?"text-green-400":"text-red-400"}`}>
+                            {s.avgPnl>=0?"+":""}${s.avgPnl.toFixed(0)}
+                          </span>
+                        ) : <span className="text-slate-700">—</span>}
+                      </td>
+                      <td className="text-right px-3 py-2.5">
+                        {s.fires > 0 ? (
+                          <span className={`font-bold ${s.totalPnl>=0?"text-green-400":"text-red-400"}`}>
+                            {s.totalPnl>=0?"+":""}${Math.round(s.totalPnl)}
+                          </span>
+                        ) : <span className="text-slate-700">—</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Best / worst highlights */}
+          {results.stratSums.some(s => s.best || s.worst) && (
+            <div className="bg-slate-800 rounded-2xl p-4 border border-slate-700/60 space-y-2">
+              <div className="text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Mejores & Peores trades</div>
+              {results.stratSums.filter(s => s.best || s.worst).map(s => (
+                <div key={s.id} className="grid grid-cols-2 gap-2 text-xs">
+                  {s.best && (
+                    <div className="bg-green-900/20 border border-green-900/40 rounded-xl px-2.5 py-2">
+                      <div className="text-green-400 font-bold">↑ Mejor E{s.id}</div>
+                      <div className="text-slate-400">{s.best.sym} {s.best.date}</div>
+                      <div className="text-green-300 font-mono">+${s.best.pnl?.toFixed(0)}</div>
+                    </div>
+                  )}
+                  {s.worst && (
+                    <div className="bg-red-900/20 border border-red-900/40 rounded-xl px-2.5 py-2">
+                      <div className="text-red-400 font-bold">↓ Peor E{s.id}</div>
+                      <div className="text-slate-400">{s.worst.sym} {s.worst.date}</div>
+                      <div className="text-red-300 font-mono">${s.worst.pnl?.toFixed(0)}</div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Trades list (collapsible) */}
+          <div className="bg-slate-800 rounded-2xl border border-slate-700/60 overflow-hidden">
+            <button onClick={() => setShowTrades(v => !v)}
+              className="w-full px-4 py-3 flex justify-between items-center">
+              <span className="text-slate-300 font-semibold text-sm">
+                Lista de trades ({filteredTrades.length})
+              </span>
+              <span className="text-slate-600 text-xs">{showTrades ? "▲" : "▼"}</span>
+            </button>
+
+            {showTrades && (
+              <>
+                {/* Filters */}
+                <div className="px-3 py-2 border-t border-b border-slate-700/40 flex gap-1.5 flex-wrap">
+                  <select value={filterSym} onChange={e => setFilterSym(e.target.value)}
+                    className="bg-slate-700 text-slate-300 text-xs rounded-lg px-2 py-1.5 border-0 focus:outline-none">
+                    <option value="all">Todos los tickers</option>
+                    {BT_SYMS.map(s => <option key={s}>{s}</option>)}
+                  </select>
+                  <select value={filterStrat} onChange={e => setFilterStrat(e.target.value)}
+                    className="bg-slate-700 text-slate-300 text-xs rounded-lg px-2 py-1.5 border-0 focus:outline-none">
+                    <option value="all">Todas las estrategias</option>
+                    {STRATS.map(s => <option key={s.id} value={String(s.id)}>E{s.id} — {s.name}</option>)}
+                  </select>
+                  <select value={filterOutcome} onChange={e => setFilterOutcome(e.target.value)}
+                    className="bg-slate-700 text-slate-300 text-xs rounded-lg px-2 py-1.5 border-0 focus:outline-none">
+                    <option value="all">Todos</option>
+                    <option value="WIN">WIN ✓</option>
+                    <option value="LOSS">LOSS ✗</option>
+                    <option value="NEUTRAL">NEUTRAL</option>
+                  </select>
+                </div>
+
+                <div className="max-h-80 overflow-y-auto divide-y divide-slate-700/20">
+                  {filteredTrades.length === 0 ? (
+                    <div className="text-center text-slate-600 text-xs py-8">Sin trades con estos filtros</div>
+                  ) : (
+                    filteredTrades.map(t => (
+                      <div key={t.id} className="px-3 py-2.5 flex items-center gap-2">
+                        <span className={`shrink-0 text-xs px-1.5 py-0.5 rounded font-bold
+                          ${t.outcome==="WIN"?"bg-green-900/60 text-green-400"
+                            :t.outcome==="LOSS"?"bg-red-900/60 text-red-400"
+                            :"bg-slate-700 text-slate-500"}`}>
+                          {t.outcome}
+                        </span>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex justify-between items-baseline">
+                            <span className="text-white font-bold text-xs">{t.sym}</span>
+                            <span className="text-slate-600 text-xs">{t.date}</span>
+                          </div>
+                          <div className="text-slate-500 text-xs truncate">
+                            E{t.stratId} {t.dir} · entrada ${parseFloat(t.entry).toFixed(2)} · salida ${parseFloat(t.exitPrice).toFixed(2)}
+                          </div>
+                        </div>
+                        <span className={`shrink-0 font-mono font-bold text-xs ${(t.pnl??0)>=0?"text-green-400":"text-red-400"}`}>
+                          {(t.pnl??0)>=0?"+":""}${Math.round(t.pnl??0)}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TAB: REF
 // ═══════════════════════════════════════════════════════════════════════════════
 function TabRef() {
@@ -2243,8 +2731,9 @@ export default function App() {
     <TabCheck   key="ch" market={market} selectedTickers={selectedTickers}/>,
     <TabCalc    key="ca" market={market} selectedTickers={selectedTickers}/>,
     <TabTrades  key="t"/>,
-    <TabBot     key="bot" market={market} selectedTickers={selectedTickers} apiKey={apiKey}/>,
-    <TabRef     key="r"/>,
+    <TabBot      key="bot"  market={market} selectedTickers={selectedTickers} apiKey={apiKey}/>,
+    <TabBacktest key="bt"   apiKey={apiKey}/>,
+    <TabRef      key="r"/>,
   ];
 
   return (
