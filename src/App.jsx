@@ -2,9 +2,8 @@ import React, { useState, useEffect, useCallback } from "react";
 
 // ─── Ticker catalog with optimal premium ranges ────────────────────────────────
 const TICKERS = [
-  { sym:"TSLA",  name:"Tesla",              range:null        },
-  { sym:"GOOGL", name:"Alphabet A",         range:null        },
-  { sym:"QQQ",   name:"Nasdaq-100 ETF",     range:null        },
+  { sym:"TSLA",  name:"Tesla",              range:[80,  160]  },
+  { sym:"GOOGL", name:"Alphabet A",         range:[60,  140]  },
   { sym:"AMZN",  name:"Amazon",             range:[65,  130]  },
   { sym:"AAPL",  name:"Apple",              range:[45,  95]   },
   { sym:"GOOG",  name:"Alphabet C",         range:[60,  140]  },
@@ -36,8 +35,8 @@ const DAYS  = ["Lunes","Martes","Miércoles","Jueves","Viernes"];
 const DTES  = [5, 4, 3, 2, 1];  // DTE guidance by weekday
 
 const LS = { KEY:"kz_api_key", TRADES:"kz_trades", CHECK:"kz_check", TREG:"kz_treg", SEL:"kz_selected" };
-const DEFAULT_SEL  = ["TSLA", "GOOGL", "QQQ"];
-const CHUNK_SIZE   = 3;
+const DEFAULT_SEL  = ["TSLA", "GOOGL", "MSFT", "META"];
+const CHUNK_SIZE   = 4;
 const INTER_DELAY  = 15; // seconds between groups
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -1812,7 +1811,7 @@ function TabBot({ market, selectedTickers, apiKey }) {
     // Symbols with open positions (extract underlying from OCC symbol)
     const activeSyms = new Set(currentPos.map(p => (p.symbol || "").replace(/[0-9].*/, "").trim()));
 
-    const watchList = tickers.length > 0 ? tickers : ["TSLA", "GOOGL", "QQQ"];
+    const watchList = tickers.length > 0 ? tickers : ["TSLA", "GOOGL", "MSFT", "META"];
 
     for (const sym of watchList) {
       const data = mkt[sym];
@@ -1999,7 +1998,7 @@ function TabBot({ market, selectedTickers, apiKey }) {
           </div>
 
           <div className="text-slate-600 text-xs">
-            Monitoreando: <span className="text-slate-400 font-semibold">{selectedTickers.join(" · ") || "TSLA · GOOGL · QQQ"}</span>
+            Monitoreando: <span className="text-slate-400 font-semibold">{selectedTickers.join(" · ") || "TSLA · GOOGL · MSFT · META"}</span>
           </div>
         </div>
       )}
@@ -2094,7 +2093,7 @@ const BT_LOSS_PCT = 0.15;   // stop −15 %
 const BT_COMM     = 2;      // $2 commission per round-trip
 const BT_WIN_MOVE = 0.015;  // +1.5 % underlying → option WIN
 const BT_LOS_MOVE = 0.025;  // −2.5 % underlying → option LOSS
-const BT_SYMS     = ["TSLA", "GOOGL", "QQQ"];
+const BT_SYMS     = ["TSLA", "GOOGL", "MSFT", "META"];
 
 async function fetchHistoricalBars(sym, apiKey, attempt = 0) {
   const to   = new Date();
@@ -2369,7 +2368,7 @@ function TabBacktest({ apiKey }) {
       {/* Methodology note */}
       <div className="bg-slate-800/60 border border-slate-700/40 rounded-xl px-3 py-2.5 space-y-0.5">
         <div className="text-slate-300 text-xs font-semibold mb-1">Metodología</div>
-        <div className="text-slate-500 text-xs">• TSLA · GOOGL · QQQ — últimos 3 meses de datos diarios</div>
+        <div className="text-slate-500 text-xs">• TSLA · GOOGL · MSFT · META — últimos 3 meses de datos diarios</div>
         <div className="text-slate-500 text-xs">• Solo condiciones auto (BB, MA, GAP, Vol) — manuales asumidas ✓</div>
         <div className="text-slate-500 text-xs">• Capital $10,000 · 5 % por trade · Plan 35 % / Stop −15 %</div>
         <div className="text-slate-500 text-xs">• WIN si underlying mueve ≥1.5 % · LOSS si mueve ≥2.5 % en contra · DTE por weekday</div>
