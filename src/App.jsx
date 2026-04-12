@@ -2230,6 +2230,13 @@ function volStochK(vols, period = 14) {
   return ((sl[sl.length - 1] - lo) / (hi - lo)) * 100;
 }
 
+// True if a Polygon timestamp (ms UTC) corresponds to 9:30 AM ET (market open bar)
+function isMarketOpen15(tsMs) {
+  const s = new Date(tsMs).toLocaleString("en-US", { timeZone: "America/New_York" });
+  const d = new Date(s);
+  return d.getHours() === 9 && d.getMinutes() === 30;
+}
+
 // 1H bars — 3 months (signal detection + MA/BB warmup)
 async function fetch1HBars(sym, apiKey, attempt = 0) {
   const to   = new Date();
@@ -2465,6 +2472,51 @@ function runBacktest(h1Data, m15Data, dailyData) {
         if (c1 && c2 && c3 && c4 && c5) tryTrade("CALL", 7, "Efecto Imán ↓→CALL", 4);
       }
     }
+
+    // ── E5/E6 Pass: market-open 15min signals ──────────────────────────────────
+    // E5 PUT: lateral BB + gap UP above upper BB + price starts falling  (9:30 ET only)
+    // E6 CALL: lateral BB + gap DOWN below lower BB + price starts rising (9:30 ET only)
+    for (let j = 22; j < m15Bars.length - 5; j++) {
+      if (!isMarketOpen15(m15Bars[j].t)) continue;
+
+      const bar15   = m15Bars[j];
+      const dateStr = new Date(bar15.t).toISOString().split("T")[0];
+
+      // BB from last 20 bars BEFORE open (previous session closes)
+      const bbPre = calcBB(m15Bars.slice(0, j).map(b => b.c), 20);
+      if (!bbPre) continue;
+
+      // C1: Totally lateral, NO volatility — BB width < 1%
+      if (bbPre.width >= 1.0) continue;
+
+      const tryTrade56 = (dir, stratId, stratName) => {
+        const nextIdx = j + 1;
+        if (nextIdx >= m15Bars.length) return;
+        const entry  = m15Bars[nextIdx].o;
+        const target = dir === "CALL" ? entry * (1 + BT_WIN_MOVE_15M)
+                                      : entry * (1 - BT_WIN_MOVE_15M);
+        let outcome = "LOSS";
+        for (let k = nextIdx; k <= nextIdx + 3 && k < m15Bars.length; k++) {
+          if (dir === "CALL" ? m15Bars[k].h >= target : m15Bars[k].l <= target) {
+            outcome = "WIN"; break;
+          }
+        }
+        rawTrades.push({ id:`${sym}_${dir.toLowerCase()}_${bar15.t}_e${stratId}`,
+          date: dateStr, sym, dir, stratId, stratName, entry, outcome });
+      };
+
+      // E6 CALL: opens below lower BB (extreme oversold gap down) + bullish candle
+      // C2: bar15.o < lower BB  C3: close > open (price starting to rise)
+      if (bar15.o < bbPre.lower && bar15.c > bar15.o) {
+        tryTrade56("CALL", 6, "Lat. Aper. ↓CALL");
+      }
+
+      // E5 PUT: opens above upper BB (extreme overbought gap up) + bearish candle
+      // C2: bar15.o > upper BB  C3: close < open (price starting to fall)
+      if (bar15.o > bbPre.upper && bar15.c < bar15.o) {
+        tryTrade56("PUT", 5, "Lat. Aper. ↑PUT");
+      }
+    }
   }
 
   // Sort chronologically; compute equity curve
@@ -2485,6 +2537,8 @@ function runBacktest(h1Data, m15Data, dailyData) {
     { id:2, name:"Cambio Tend. ↓",    dir:"PUT"  },
     { id:3, name:"Rebote PM ↓",       dir:"PUT"  },
     { id:4, name:"Rebote PM ↑",       dir:"CALL" },
+    { id:5, name:"Lat. Aper. ↑PUT",   dir:"PUT"  },
+    { id:6, name:"Lat. Aper. ↓CALL",  dir:"CALL" },
     { id:7, name:"Efecto Imán ↓CALL", dir:"CALL" },
     { id:8, name:"Efecto Imán ↑PUT",  dir:"PUT"  },
   ];
@@ -2643,14 +2697,16 @@ function TabBacktest({ apiKey }) {
 
       {/* Methodology note */}
       <div className="bg-slate-800/60 border border-slate-700/40 rounded-xl px-3 py-2.5 space-y-0.5">
-        <div className="text-slate-300 text-xs font-semibold mb-1">6 Estrategias — datos 1H + 15min + Diario</div>
+        <div className="text-slate-300 text-xs font-semibold mb-1">8 Estrategias — datos 1H + 15min + Diario</div>
         <div className="text-slate-500 text-xs">• E1 CALL Cambio Tend. ↑: bajista 1H → rompe MA20 al alza + 15min alcista</div>
         <div className="text-slate-500 text-xs">• E2 PUT Cambio Tend. ↓: alcista 1H → rompe MA20 a la baja + 15min bajista</div>
         <div className="text-slate-500 text-xs">• E3 PUT Rebote PM ↓: tendencia bajista DIA + rally 1H toca BB media DIA + 15min baja</div>
         <div className="text-slate-500 text-xs">• E4 CALL Rebote PM ↑: tendencia alcista DIA + pullback 1H toca BB media DIA + 15min sube</div>
+        <div className="text-slate-500 text-xs">• E5 PUT Lat. Aper. ↑: BB 15min lat. &lt;1% + gap sube sobre BB sup a las 9:30 ET + vela bajista</div>
+        <div className="text-slate-500 text-xs">• E6 CALL Lat. Aper. ↓: BB 15min lat. &lt;1% + gap baja bajo BB inf a las 9:30 ET + vela alcista</div>
         <div className="text-slate-500 text-xs">• E7 CALL Efecto Imán ↓: bajista 1H ≥5d + gap baja 1.5% + precio &gt;2% bajo MA20 + 15min bajo BB inf</div>
         <div className="text-slate-500 text-xs">• E8 PUT Efecto Imán ↑: alcista 1H ≥5d + gap sube 1.5% + precio &gt;2% sobre MA20 + 15min sobre BB sup</div>
-        <div className="text-slate-500 text-xs">• WIN E1/E2/E7/E8 = ±1.5% en 4 velas 15min · WIN E3/E4 = ±1.5% en 8 velas 15min</div>
+        <div className="text-slate-500 text-xs">• WIN E1/E2/E5/E6/E7/E8 = ±1.5% en 4 velas 15min · WIN E3/E4 = ±1.5% en 8 velas 15min</div>
         <div className="text-slate-500 text-xs">• Sell limit inmediato: Plan 10% ×1.10 · Plan 35% ×1.35 · Plan 100% ×2.00 · +$2 comisión</div>
       </div>
 
@@ -2756,6 +2812,18 @@ function TabBacktest({ apiKey }) {
                        "C3+C4: Precio toca BB media DIA (mínimo dentro ±0.3%) y cierra por encima",
                        "C5: Vela 1H alcista + última vela 15min alcista (confirmación)",
                        "WIN: +1.5% en 8 velas 15min (2h para jugar el rebote)"] },
+              { label:"E5 PUT — Lateral Apertura Arriba", color:"text-red-400", bg:"bg-red-900/20",
+                conds:["C1: BB 15min TOTALMENTE LATERAL sin volatilidad — ancho BB < 1%",
+                       "C2: GAP de apertura AL ALZA: precio abre sobre disipador SUPERIOR (zona sobrecompra)",
+                       "C3: Precio comienza a BAJAR — primera vela 9:30 ET es bajista (cierre < apertura)",
+                       "C4: Señal válida SOLO en los primeros 5min (vela 9:30–9:35 ET)",
+                       "WIN: −1.5% en 4 velas 15min  |  Sin señal antes de 9:35 = NO ENTRAR"] },
+              { label:"E6 CALL — Lateral Apertura Abajo", color:"text-green-400", bg:"bg-green-900/20",
+                conds:["C1: BB 15min TOTALMENTE LATERAL sin volatilidad — ancho BB < 1%",
+                       "C2: GAP de apertura A LA BAJA: precio abre bajo disipador INFERIOR (zona sobreventa)",
+                       "C3: Precio comienza a SUBIR — primera vela 9:30 ET es alcista (cierre > apertura)",
+                       "C4: Señal válida SOLO en los primeros 5min (vela 9:30–9:35 ET)",
+                       "WIN: +1.5% en 4 velas 15min  |  Sin señal antes de 9:35 = NO ENTRAR"] },
               { label:"E7 CALL — Efecto Imán Bajista", color:"text-green-400", bg:"bg-green-900/20",
                 conds:["C1: 1H BAJISTA ≥5 días — mínimos más bajos, MA20 < MA40 (medias NO entrelazadas)",
                        "C2: GAP de apertura a la BAJA > 1.5% vs cierre anterior",
@@ -2809,6 +2877,8 @@ function TabBacktest({ apiKey }) {
                     <option value="2">E2 — Cambio Tendencia ↓ PUT</option>
                     <option value="3">E3 — Rebote Punto Medio ↓ PUT</option>
                     <option value="4">E4 — Rebote Punto Medio ↑ CALL</option>
+                    <option value="5">E5 — Lateral Apertura ↑ PUT</option>
+                    <option value="6">E6 — Lateral Apertura ↓ CALL</option>
                     <option value="7">E7 — Efecto Imán ↓ CALL</option>
                     <option value="8">E8 — Efecto Imán ↑ PUT</option>
                   </select>
