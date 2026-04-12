@@ -1,24 +1,25 @@
 import React, { useState, useEffect, useCallback } from "react";
 
-// ─── Ticker catalog with optimal premium ranges ────────────────────────────────
+// ─── Ticker catalog with optimal option contract Ask price ranges ──────────────
+// range = [minAsk, maxAsk] of the option CONTRACT (not stock price)
 const TICKERS = [
-  { sym:"TSLA",  name:"Tesla",              range:[80,  160]  },
-  { sym:"GOOGL", name:"Alphabet A",         range:[60,  140]  },
-  { sym:"AMZN",  name:"Amazon",             range:[65,  130]  },
-  { sym:"AAPL",  name:"Apple",              range:[45,  95]   },
-  { sym:"GOOG",  name:"Alphabet C",         range:[60,  140]  },
-  { sym:"META",  name:"Meta",               range:[50,  170]  },
-  { sym:"MSFT",  name:"Microsoft",          range:[70,  155]  },
-  { sym:"NFLX",  name:"Netflix",            range:[55,  85]   },
-  { sym:"PLTR",  name:"Palantir",           range:[160, 350]  },
-  { sym:"NVDA",  name:"NVIDIA",             range:[80,  170]  },
-  { sym:"AMD",   name:"AMD",                range:[65,  140]  },
-  { sym:"DIA",   name:"Dow Jones ETF",      range:[130, 220]  },
-  { sym:"IWM",   name:"Russell 2000 ETF",   range:[40,  70]   },
-  { sym:"SPY",   name:"S&P 500 ETF",        range:[30,  45]   },
-  { sym:"GLD",   name:"Gold ETF",           range:[60,  120]  },
-  { sym:"SLV",   name:"Silver ETF",         range:[60,  75]   },
-  { sym:"USO",   name:"Oil ETF",            range:[50,  100]  },
+  { sym:"TSLA",  name:"Tesla",              range:[0.80, 1.60] },
+  { sym:"GOOGL", name:"Alphabet A",         range:[0.60, 1.40] },
+  { sym:"AMZN",  name:"Amazon",             range:[0.65, 1.30] },
+  { sym:"AAPL",  name:"Apple",              range:[0.45, 0.95] },
+  { sym:"GOOG",  name:"Alphabet C",         range:[0.60, 1.40] },
+  { sym:"META",  name:"Meta",               range:[0.50, 1.70] },
+  { sym:"MSFT",  name:"Microsoft",          range:[0.70, 1.55] },
+  { sym:"NFLX",  name:"Netflix",            range:[0.55, 0.85] },
+  { sym:"PLTR",  name:"Palantir",           range:[0.40, 0.90] },
+  { sym:"NVDA",  name:"NVIDIA",             range:[0.80, 1.70] },
+  { sym:"AMD",   name:"AMD",                range:[0.65, 1.40] },
+  { sym:"DIA",   name:"Dow Jones ETF",      range:[0.50, 1.10] },
+  { sym:"IWM",   name:"Russell 2000 ETF",   range:[0.40, 0.70] },
+  { sym:"SPY",   name:"S&P 500 ETF",        range:[0.30, 0.65] },
+  { sym:"GLD",   name:"Gold ETF",           range:[0.45, 1.00] },
+  { sym:"SLV",   name:"Silver ETF",         range:[0.30, 0.60] },
+  { sym:"USO",   name:"Oil ETF",            range:[0.35, 0.75] },
 ];
 const SYMS       = TICKERS.map(t => t.sym);
 const TICKER_MAP = Object.fromEntries(TICKERS.map(t => [t.sym, t]));
@@ -581,7 +582,6 @@ function TickerRow({ tk, data, loading, error, expanded, onToggle }) {
 
   const up     = data.changePct >= 0;
   const isLow  = data.bb && data.bb.width < LOW_VOL_PCT;
-  const inR    = tk.range ? data.price>=tk.range[0] && data.price<=tk.range[1] : null;
 
   return (
     <div className="bg-slate-800 rounded-xl border border-slate-700/50 overflow-hidden">
@@ -606,11 +606,6 @@ function TickerRow({ tk, data, loading, error, expanded, onToggle }) {
           <span className={`text-xs px-1.5 py-0.5 rounded-md font-bold ${data.signal.bg} ${data.signal.color}`}>
             {data.signal.label}
           </span>
-          {inR !== null && (
-            <span className={`text-xs px-1 py-0.5 rounded font-bold ${inR?"bg-green-900/40 text-green-400":"bg-red-900/40 text-red-400"}`}>
-              {inR?"✓ Rango":"✗ Rango"}
-            </span>
-          )}
         </div>
         <span className="text-slate-600 text-xs ml-1">{expanded?"▲":"▼"}</span>
       </button>
@@ -636,9 +631,9 @@ function TickerRow({ tk, data, loading, error, expanded, onToggle }) {
             </div>
           </div>
           {tk.range && (
-            <div className={`text-xs px-3 py-1.5 rounded-lg flex justify-between ${inR?"bg-green-900/30 text-green-300":"bg-red-900/30 text-red-300"}`}>
-              <span>Rango óptimo premium</span>
-              <span>${tk.range[0]} – ${tk.range[1]}</span>
+            <div className="text-xs px-3 py-1.5 rounded-lg flex justify-between bg-slate-700/50 text-slate-400">
+              <span>Rango Ask contrato</span>
+              <span className="text-slate-300">${tk.range[0].toFixed(2)} – ${tk.range[1].toFixed(2)}</span>
             </div>
           )}
           {isLow && (
@@ -1364,8 +1359,8 @@ function TabCalc({ market }) {
   const C  = parseFloat(comm)   || 0;
   const d  = market[sym];
   const isLow  = d?.bb && d.bb.width < LOW_VOL_PCT;
-  const inRange= tk.range && E>0 ? E>=tk.range[0] && E<=tk.range[1] : null;
-  const liveInRange = tk.range && livePrice ? livePrice>=tk.range[0] && livePrice<=tk.range[1] : null;
+  // inRange: user-entered Ask price vs option contract range (correct comparison)
+  const inRange = tk.range && E>0 ? E>=tk.range[0] && E<=tk.range[1] : null;
 
   return (
     <div className="space-y-4">
@@ -1389,24 +1384,15 @@ function TabCalc({ market }) {
           ))}
         </div>
 
-        {/* Range badge */}
+        {/* Range badge — shows optimal Ask range for this ticker's contract */}
         {tk.range && (
-          <div className={`flex justify-between items-center text-xs px-3 py-2 rounded-xl border
-            ${liveInRange===true?"bg-green-900/30 border-green-900/50":
-              liveInRange===false?"bg-red-900/30 border-red-900/50":
-              "bg-slate-700/50 border-slate-600/50"}`}>
+          <div className="flex justify-between items-center text-xs px-3 py-2 rounded-xl border bg-slate-700/50 border-slate-600/50">
             <div>
-              <div className={`font-bold ${liveInRange===true?"text-green-400":liveInRange===false?"text-red-400":"text-slate-300"}`}>
-                {liveInRange===true?"✓ Precio en rango óptimo":
-                 liveInRange===false?"✗ Precio fuera del rango":
-                 "Rango óptimo premium"}
-              </div>
-              <div className="text-slate-500 mt-0.5">${tk.range[0]} – ${tk.range[1]}</div>
+              <div className="font-bold text-slate-300">Rango Ask contrato óptimo</div>
+              <div className="text-slate-500 mt-0.5">${tk.range[0].toFixed(2)} – ${tk.range[1].toFixed(2)}</div>
             </div>
             {livePrice && (
-              <div className={`font-bold text-sm ${liveInRange?"text-green-400":"text-red-400"}`}>
-                ${f2(livePrice)}
-              </div>
+              <div className="text-slate-400 font-mono text-sm">${f2(livePrice)}</div>
             )}
           </div>
         )}
@@ -1462,17 +1448,11 @@ function TabCalc({ market }) {
             const target   = E*(1+plan.pct);
             const raw      = (target-E)*S;
             const net      = raw-C;
-            const tInRange = tk.range ? target>=tk.range[0]&&target<=tk.range[1] : null;
             return (
               <div key={plan.id} className={`bg-gradient-to-br ${plan.from} ${plan.to} rounded-2xl p-4 shadow-lg`}>
                 <div className="flex justify-between items-center">
                   <span className="text-white font-bold">{plan.label}</span>
-                  <div className="flex items-center gap-2">
-                    {tInRange!==null && (
-                      <span className="text-white/80 text-xs">{tInRange?"✓ Rango":"✗ Rango"}</span>
-                    )}
-                    <span className="text-white/70 text-sm font-mono">+{(plan.pct*100).toFixed(0)}%</span>
-                  </div>
+                  <span className="text-white/70 text-sm font-mono">+{(plan.pct*100).toFixed(0)}%</span>
                 </div>
                 <div className="text-white text-3xl font-black tracking-tight mt-1">${f2(target)}</div>
                 {S>0 && (
@@ -1496,18 +1476,16 @@ function TabCalc({ market }) {
             );
           })}
 
-          <div className="bg-slate-800 rounded-2xl p-4 border border-slate-700/60">
-            <div className="text-red-400 text-xs font-bold mb-2 uppercase tracking-wider">Stop Loss</div>
-            {[["−8%",0.08],["−15%",0.15]].map(([lbl,pct])=>(
-              <div key={lbl} className="flex justify-between text-xs mb-1.5">
-                <span className="text-slate-400">{lbl}</span>
-                <span className="text-red-400 font-mono">
-                  ${f2(E*(1-pct))}
-                  {S>0&&` → pérdida neta −$${((E*pct*S)+C).toFixed(0)}`}
-                </span>
+          {E>0 && (
+            <div className="bg-slate-800 rounded-2xl p-4 border border-slate-700/60">
+              <div className="text-yellow-400 text-xs font-bold mb-2 uppercase tracking-wider">Refuerzo (−50%)</div>
+              <div className="flex justify-between text-xs mb-1.5">
+                <span className="text-slate-400">Si llega a</span>
+                <span className="text-yellow-400 font-mono">${f2(E*0.50)}</span>
               </div>
-            ))}
-          </div>
+              <div className="text-slate-500 text-xs">Comprar más contratos mismo strike · nunca más del monto inicial</div>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1873,24 +1851,17 @@ function TabBot({ market, selectedTickers, apiKey }) {
             price: sellTarget.toFixed(2), duration: "gtc",
           });
 
-          // ── Stop-loss metadata (monitored next cycle via positions check) ────
-          // Plan 10%: −20% max, cut at 15 min
-          // Plan 35%: −20% max, cut before 4:00pm ET
-          // Plan 100%: −20% max anytime
-          const stopPct    = 0.20;
-          const stopPrice  = parseFloat((entry * (1 - stopPct)).toFixed(2));
           const planLabel  = planObj.label;
 
           addLog(`✅ COMPRA ejecutada: ${sym} ${strat.dir} $${entry.toFixed(2)} — Venta limit colocada en $${sellTarget.toFixed(2)}`, "success");
-          addLog(`   ${qty} contrato${qty>1?"s":""} · Strike $${closest.strike} · Exp ${expDate} · Stop −20% @ $${stopPrice}`, "info");
-          addLog(`   ${planLabel}: objetivo +${(planObj.pct*100).toFixed(0)}% · ${planObj.pct===0.10?"cortar en 15min":planObj.pct===0.35?"cortar antes de 4:00pm":"cortar si −20%"}`, "info");
+          addLog(`   ${qty} contrato${qty>1?"s":""} · Strike $${closest.strike} · Exp ${expDate} · ${planLabel}: objetivo +${(planObj.pct*100).toFixed(0)}%`, "info");
 
           // Record
           const rec = {
             id: Date.now(), date: new Date().toISOString(),
             sym, dir: strat.dir, stratId: strat.id, stratName: strat.name,
             optionSymbol: closest.symbol, strike: closest.strike,
-            expDate, qty, entry, target: sellTarget, stop: stopPrice,
+            expDate, qty, entry, target: sellTarget,
             plan: plan, planLabel, status: "ABIERTA",
           };
           setBotTrades(prev => { const n = [rec, ...prev]; save(LS_BOT_TRADES, n); return n; });
@@ -1902,34 +1873,20 @@ function TabBot({ market, selectedTickers, apiKey }) {
         break; // one strategy per ticker per cycle
       }
     }
-    // ── Stop-loss monitor: check open bot trades against current market ────────
+    // ── Monitor open trades for objective hit (no stop-loss — Kaizen methodology) ─
     const openTrades = load(LS_BOT_TRADES, []).filter(bt => bt.status === "ABIERTA");
-    const etNowCheck = getETNow();
-    const etMinutes  = etNowCheck.getHours() * 60 + etNowCheck.getMinutes();
 
     for (const bt of openTrades) {
       const liveData = mkt[bt.sym];
       if (!liveData) continue;
       const livePrice = liveData.price;
 
-      // Check if objective was hit (live price ≥ sell target for CALL, ≤ for PUT)
+      // Check if sell limit was hit (live stock price approximates option target hit)
       const objHit = bt.dir === "CALL" ? livePrice >= bt.target : livePrice <= bt.target;
-      // Check if stop was hit (live price ≤ stop for CALL, ≥ for PUT)
-      const stopHit = bt.dir === "CALL" ? livePrice <= bt.stop : livePrice >= bt.stop;
-      // Plan 10%: cut at 15 min (market open = 9:30 → cut at 9:45)
-      const plan10Cut = bt.plan === "p10" && etMinutes >= 9 * 60 + 45;
-      // Plan 35%: cut before 4:00pm (within 5 min of close)
-      const plan35Cut = bt.plan === "p35" && etMinutes >= 15 * 60 + 55;
 
       if (objHit) {
         addLog(`🎯 OBJETIVO ALCANZADO: +${((bt.target / bt.entry - 1) * 100).toFixed(0)}% ganancia — ${bt.sym} ${bt.dir}`, "success");
         setBotTrades(prev => { const n = prev.map(x => x.id === bt.id ? { ...x, status: "GANANCIA" } : x); save(LS_BOT_TRADES, n); return n; });
-      } else if (stopHit) {
-        addLog(`🚫 STOP LOSS: −20% cortado — ${bt.sym} ${bt.dir} @ $${livePrice.toFixed(2)}`, "error");
-        setBotTrades(prev => { const n = prev.map(x => x.id === bt.id ? { ...x, status: "STOP" } : x); save(LS_BOT_TRADES, n); return n; });
-      } else if (plan10Cut || plan35Cut) {
-        addLog(`⏱ CORTE POR TIEMPO (${bt.planLabel}): ${bt.sym} ${bt.dir} @ $${livePrice.toFixed(2)}`, "warning");
-        setBotTrades(prev => { const n = prev.map(x => x.id === bt.id ? { ...x, status: "CORTADO" } : x); save(LS_BOT_TRADES, n); return n; });
       }
     }
 
@@ -2096,18 +2053,14 @@ function TabBot({ market, selectedTickers, apiKey }) {
                   </span>
                 </div>
                 <div className="text-slate-500 text-xs font-mono mt-0.5 truncate">{t.optionSymbol}</div>
-                <div className="grid grid-cols-3 gap-1 mt-1.5 text-xs">
+                <div className="grid grid-cols-2 gap-1 mt-1.5 text-xs">
                   <div className="bg-slate-700/40 rounded px-1.5 py-1 text-center">
                     <div className="text-slate-600 leading-none mb-0.5">Compra</div>
                     <div className="text-white font-mono">${t.entry?.toFixed(2)}</div>
                   </div>
                   <div className="bg-green-900/30 rounded px-1.5 py-1 text-center">
-                    <div className="text-slate-600 leading-none mb-0.5">🎯 Venta</div>
+                    <div className="text-slate-600 leading-none mb-0.5">🎯 Objetivo</div>
                     <div className="text-green-400 font-mono">${t.target?.toFixed(2)}</div>
-                  </div>
-                  <div className="bg-red-900/30 rounded px-1.5 py-1 text-center">
-                    <div className="text-slate-600 leading-none mb-0.5">🚫 Stop</div>
-                    <div className="text-red-400 font-mono">${t.stop?.toFixed(2)}</div>
                   </div>
                 </div>
                 <div className="flex justify-between mt-1 text-xs">
@@ -2148,17 +2101,35 @@ function TabBot({ market, selectedTickers, apiKey }) {
 const BT_CAPITAL  = 10000;  // virtual starting capital
 const BT_POS_PCT  = 0.05;   // 5 % of equity per trade
 const BT_WIN_PCT  = 0.35;   // Plan 35 % profit target
-const BT_LOSS_PCT = 0.20;   // stop −20 %
 const BT_COMM     = 2;      // $2 commission per round-trip
-// Underlying moves that trigger option WIN/LOSS (both directions):
-//   CALL WIN  : stock HIGH   rises  ≥ BT_WIN_MOVE  from entry
-//   CALL LOSS : stock LOW    drops  ≥ BT_LOS_MOVE  from entry
-//   PUT  WIN  : stock LOW    drops  ≥ BT_WIN_MOVE  from entry
-//   PUT  LOSS : stock HIGH   rises  ≥ BT_LOS_MOVE  from entry
-const BT_WIN_MOVE = 0.025;  // 2.5 % → approx 35 % option gain (3x leverage)
-const BT_LOS_MOVE = 0.020;  // 2.0 % → approx −20 % option loss
-const BT_LEVERAGE = 3.5;    // leverage for NEUTRAL P&L calculation
+// Stock move that triggers option WIN (no stop-loss — hold until WIN or expiry):
+//   CALL WIN : stock HIGH rises  ≥ BT_WIN_MOVE from entry
+//   PUT  WIN : stock LOW  drops  ≥ BT_WIN_MOVE from entry
+//   No WIN by expiry → LOSS (full option premium lost)
+const BT_WIN_MOVE = 0.025;  // 2.5 % underlying → ≈35 % option gain
 const BT_SYMS     = ["TSLA", "GOOGL", "MSFT", "META"];
+
+// ─── Option price estimation (for range filter in backtest) ───────────────────
+// Calibrated formula: Ask ≈ stockPrice × OPT_K × sqrt(dte/5) × exp(-otmPct × OPT_DECAY)
+const OPT_K     = 0.0163;
+const OPT_DECAY = 20;
+
+function estimateOptionAsk(stockPrice, otmPct, dte) {
+  return stockPrice * OPT_K * Math.sqrt(dte / 5) * Math.exp(-otmPct * OPT_DECAY);
+}
+
+// Returns [minOtmPct, maxOtmPct] whose estimated Ask falls within optRange,
+// or null if range is unreachable for this stock price / dte combination.
+function getValidOtmRange(stockPrice, optRange, dte) {
+  const base = stockPrice * OPT_K * Math.sqrt(dte / 5);
+  if (base <= 0) return null;
+  // maxAsk (most expensive, least OTM) → smallest otmPct
+  const minOtm = -Math.log(optRange[1] / base) / OPT_DECAY;
+  // minAsk (cheapest, most OTM) → largest otmPct
+  const maxOtm = -Math.log(optRange[0] / base) / OPT_DECAY;
+  if (!isFinite(minOtm) || !isFinite(maxOtm) || minOtm > maxOtm) return null;
+  return [Math.max(0, minOtm), maxOtm];
+}
 
 async function fetchHistoricalBars(sym, apiKey, attempt = 0) {
   const to   = new Date();
@@ -2234,14 +2205,21 @@ function getAutoCondIds(strat) {
 
 // runBacktest(dailyData, hourlyData)
 // dailyData  — 7-month daily bars per symbol  (signal detection + MA/BB warmup)
-// hourlyData — 3-month hourly bars per symbol (intraday WIN/LOSS detection)
+// hourlyData — 3-month hourly bars per symbol (intraday WIN detection)
+// No stop-loss: hold until WIN (target hit) or expiry (full LOSS of premium).
+// Weekday strike rule:
+//   Mon/Tue  → cheapest Ask in range (highest OTM%) → maxOtmPct
+//   Wed      → mid Ask (mid OTM%)
+//   Thu/Fri  → most expensive Ask in range (lowest OTM%) → minOtmPct
 function runBacktest(dailyData, hourlyData) {
   const cutoff = new Date(); cutoff.setMonth(cutoff.getMonth() - 3);
   const rawTrades = [];
+  let filteredCount = 0; // signals skipped because Ask was outside range
 
   for (const sym of BT_SYMS) {
     const bars  = dailyData[sym];
-    const hBars = hourlyData[sym] || []; // may be empty — falls back to daily H/L
+    const hBars = hourlyData[sym] || [];
+    const tk    = TICKER_MAP[sym];
     if (!bars || bars.length < 55) continue;
 
     for (let i = 50; i < bars.length - 2; i++) {
@@ -2255,7 +2233,7 @@ function runBacktest(dailyData, hourlyData) {
 
       const dateStr = barDate.toISOString().split("T")[0];
 
-      // Try every strategy — both CALL and PUT must be evaluated independently
+      // Try every strategy — both CALL and PUT evaluated independently
       for (const strat of STRATS) {
         const condIds = getAutoCondIds(strat);
         const autoRes = evalAuto(data, strat);
@@ -2268,34 +2246,45 @@ function runBacktest(dailyData, hourlyData) {
 
         const dte = dow >= 1 && dow <= 5 ? DTES[dow - 1] : 3;
 
-        // ── Build the intraday simulation bars ──────────────────────────────
-        // Prefer hourly bars if available (better precision); fall back to daily H/L
+        // ── Option range filter (Kaizen rule: skip if Ask outside range) ────
+        // Estimate option Ask using OTM% based on weekday rule
+        let optAsk = null;
+        if (tk.range) {
+          const otmRange = getValidOtmRange(entry, tk.range, dte);
+          if (!otmRange) { filteredCount++; continue; } // no valid OTM in range
+          const [minOtm, maxOtm] = otmRange;
+          // Select OTM% by weekday: Mon/Tue=cheapest(maxOtm), Wed=mid, Thu/Fri=expensive(minOtm)
+          let otmPct;
+          if (dow <= 2) otmPct = maxOtm;           // Mon/Tue: cheapest
+          else if (dow === 3) otmPct = (minOtm + maxOtm) / 2; // Wed: mid
+          else otmPct = minOtm;                    // Thu/Fri: most expensive
+          optAsk = estimateOptionAsk(entry, otmPct, dte);
+          // Double-check it's in range (floating point safety)
+          if (optAsk < tk.range[0] || optAsk > tk.range[1]) { filteredCount++; continue; }
+        }
+
+        // ── Build intraday simulation bars ───────────────────────────────────
+        // Prefer hourly bars; fall back to daily H/L
         const entryTs  = nextBar.t;
         const expiryTs = entryTs + (dte + 1) * 24 * 60 * 60 * 1000;
         const simBars  = hBars.filter(b => b.t >= entryTs && b.t <= expiryTs).length > 0
           ? hBars.filter(b => b.t >= entryTs && b.t <= expiryTs)
-          : bars.slice(i + 1, i + 1 + dte + 2); // daily fallback
+          : bars.slice(i + 1, i + 1 + dte + 2);
 
-        let outcome   = "NEUTRAL";
-        let exitPrice = nextBar.c; // default: close of entry day
-
+        // Hold until WIN or expiry — no stop-loss
+        let outcome = "LOSS"; // default: expires worthless
         for (const sb of simBars) {
-          // CALL: WIN when stock goes UP enough, LOSS when it falls enough
-          // PUT:  WIN when stock goes DOWN enough, LOSS when it rises enough
           if (strat.dir === "CALL") {
-            if (sb.high / entry - 1 >= BT_WIN_MOVE) { outcome = "WIN";  exitPrice = entry * (1 + BT_WIN_MOVE); break; }
-            if (1 - sb.low  / entry >= BT_LOS_MOVE) { outcome = "LOSS"; exitPrice = entry * (1 - BT_LOS_MOVE); break; }
+            if (sb.high / entry - 1 >= BT_WIN_MOVE) { outcome = "WIN"; break; }
           } else { // PUT
-            if (1 - sb.low  / entry >= BT_WIN_MOVE) { outcome = "WIN";  exitPrice = entry * (1 - BT_WIN_MOVE); break; }
-            if (sb.high / entry - 1 >= BT_LOS_MOVE) { outcome = "LOSS"; exitPrice = entry * (1 + BT_LOS_MOVE); break; }
+            if (1 - sb.low / entry >= BT_WIN_MOVE)  { outcome = "WIN"; break; }
           }
-          exitPrice = sb.c; // track last close for NEUTRAL P&L
         }
 
         rawTrades.push({
           id: `${sym}_s${strat.id}_${dateStr}`,
           date: dateStr, sym, stratId: strat.id, stratName: strat.name,
-          dir: strat.dir, entry, exitPrice, outcome,
+          dir: strat.dir, entry, optAsk, outcome,
           exitDate: new Date(expiryTs).toISOString().split("T")[0],
         });
         break; // one strategy per bar per ticker (first match wins)
@@ -2313,20 +2302,9 @@ function runBacktest(dailyData, hourlyData) {
     const invest = equity * BT_POS_PCT;
 
     if (t.outcome === "WIN") {
-      t.pnl = invest * BT_WIN_PCT - BT_COMM;
-
-    } else if (t.outcome === "LOSS") {
-      t.pnl = -(invest * BT_LOSS_PCT) - BT_COMM;
-
+      t.pnl = invest * BT_WIN_PCT - BT_COMM;    // +35% of option premium invested
     } else {
-      // NEUTRAL: price didn't hit either threshold within DTE.
-      // Calculate the actual directional move and apply leverage.
-      // CALL: profit if stock went up; PUT: profit if stock went down.
-      const dirMove = t.dir === "CALL"
-        ? (t.exitPrice - t.entry) / t.entry
-        : (t.entry - t.exitPrice) / t.entry;
-      const optReturn = Math.max(-BT_LOSS_PCT, Math.min(BT_WIN_PCT, dirMove * BT_LEVERAGE));
-      t.pnl = invest * optReturn - BT_COMM;
+      t.pnl = -invest - BT_COMM;                 // Full loss of option premium at expiry
     }
 
     equity += t.pnl;
@@ -2361,7 +2339,7 @@ function runBacktest(dailyData, hourlyData) {
   const totalWins = rawTrades.filter(t => t.outcome === "WIN").length;
   return {
     trades: rawTrades, curve, stratSums, equity,
-    totalTrades: rawTrades.length, totalWins,
+    totalTrades: rawTrades.length, totalWins, filteredCount,
     winRate: rawTrades.length ? totalWins / rawTrades.length * 100 : 0,
     totalPnl: equity - BT_CAPITAL,
     callTrades: callTrades.length, callWins, callPnl,
@@ -2514,6 +2492,16 @@ function TabBacktest({ apiKey }) {
 
       {results && (
         <>
+          {/* Methodology note */}
+          <div className="bg-slate-800/60 rounded-xl px-3 py-2.5 border border-slate-700/40 text-xs text-slate-400 space-y-0.5">
+            <div className="font-bold text-slate-300">Metodología Kaizen — sin stop loss</div>
+            <div>WIN: acción mueve +2.5% en dirección correcta → +35% premium</div>
+            <div>LOSS: no llega al objetivo → expira sin valor (−100% premium)</div>
+            {results.filteredCount > 0 && (
+              <div className="text-yellow-500">⚠ {results.filteredCount} señales filtradas por Ask fuera del rango óptimo</div>
+            )}
+          </div>
+
           {/* Summary cards */}
           <div className="grid grid-cols-2 gap-2">
             {[
@@ -2793,9 +2781,10 @@ function TabRef() {
         ]},
         { title:"Gestión de Riesgo", color:"text-red-400", bullets:[
           "Máx 2–3% del capital total por operación",
-          "Stop Loss: −8% swing rápido / −15% largo",
+          "NO hay stop loss automático — dejar correr hasta objetivo o vencimiento",
+          "Refuerzo: si −50%, comprar más contratos mismo strike (máx = monto inicial)",
           "Comisión: $2 por operación (incluir en cálculo)",
-          "Nunca promediar a la baja en tendencia bajista",
+          "Rango Ask contrato: verificar que el precio esté dentro del rango óptimo",
           "Completar el checklist ANTES de entrar",
         ]},
         { title:"DTE por Día de Semana", color:"text-orange-400", items:[
