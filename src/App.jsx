@@ -2180,200 +2180,186 @@ function TabBot({ market, selectedTickers, apiKey }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// BACKTEST ENGINE
+// BACKTEST ENGINE — Estrategia Cambio de Tendencia (1H + 15min)
 // ═══════════════════════════════════════════════════════════════════════════════
-const BT_CAPITAL  = 10000;  // virtual starting capital
-const BT_POS_PCT  = 0.05;   // 5 % of equity per trade
-const BT_WIN_PCT  = 0.35;   // Plan 35 % profit target
-const BT_COMM     = 2;      // $2 commission per round-trip
-// Stock move that triggers option WIN (no stop-loss — hold until WIN or expiry):
-//   CALL WIN : stock HIGH rises  ≥ BT_WIN_MOVE from entry
-//   PUT  WIN : stock LOW  drops  ≥ BT_WIN_MOVE from entry
-//   No WIN by expiry → LOSS (full option premium lost)
-const BT_WIN_MOVE = 0.025;  // 2.5 % underlying → ≈35 % option gain
-const BT_SYMS     = ["TSLA", "GOOGL", "MSFT", "META"];
+const BT_CAPITAL = 10000;  // virtual starting capital
+const BT_POS_PCT = 0.05;   // 5 % of equity per trade
+const BT_WIN_PCT = 0.35;   // Plan 35 % profit target
+const BT_COMM    = 2;      // $2 commission per round-trip
+const BT_SYMS    = ["TSLA", "GOOGL", "MSFT", "META"];
+// WIN condition: 1.5% price move in right direction within 4 fifteen-min bars after signal
+const BT_WIN_MOVE_15M = 0.015;
 
-// ─── Option price estimation (for range filter in backtest) ───────────────────
-// Calibrated formula: Ask ≈ stockPrice × OPT_K × sqrt(dte/5) × exp(-otmPct × OPT_DECAY)
-const OPT_K     = 0.0163;
-const OPT_DECAY = 20;
+// ─── Backtest data helpers ────────────────────────────────────────────────────
 
-function estimateOptionAsk(stockPrice, otmPct, dte) {
-  return stockPrice * OPT_K * Math.sqrt(dte / 5) * Math.exp(-otmPct * OPT_DECAY);
+// Binary search: last bar index with timestamp ≤ targetTs (bars must be sorted asc)
+function findBarIndex(bars, targetTs) {
+  let lo = 0, hi = bars.length - 1, res = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (bars[mid].t <= targetTs) { res = mid; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  return res;
 }
 
-// Returns [minOtmPct, maxOtmPct] whose estimated Ask falls within optRange,
-// or null if range is unreachable for this stock price / dte combination.
-function getValidOtmRange(stockPrice, optRange, dte) {
-  const base = stockPrice * OPT_K * Math.sqrt(dte / 5);
-  if (base <= 0) return null;
-  // maxAsk (most expensive, least OTM) → smallest otmPct
-  const minOtm = -Math.log(optRange[1] / base) / OPT_DECAY;
-  // minAsk (cheapest, most OTM) → largest otmPct
-  const maxOtm = -Math.log(optRange[0] / base) / OPT_DECAY;
-  if (!isFinite(minOtm) || !isFinite(maxOtm) || minOtm > maxOtm) return null;
-  return [Math.max(0, minOtm), maxOtm];
+// True if lows[] shows a general downtrend (≥60% of consecutive pairs are lower)
+function checkLowerLows(lows) {
+  if (lows.length < 4) return false;
+  let down = 0;
+  for (let i = 1; i < lows.length; i++) { if (lows[i] < lows[i-1]) down++; }
+  return down >= Math.ceil((lows.length - 1) * 0.6);
 }
 
-async function fetchHistoricalBars(sym, apiKey, attempt = 0) {
+// True if highs[] shows a general uptrend (≥60% of consecutive pairs are higher)
+function checkHigherHighs(highs) {
+  if (highs.length < 4) return false;
+  let up = 0;
+  for (let i = 1; i < highs.length; i++) { if (highs[i] > highs[i-1]) up++; }
+  return up >= Math.ceil((highs.length - 1) * 0.6);
+}
+
+// 1H bars — 3 months (signal detection + MA/BB warmup)
+async function fetch1HBars(sym, apiKey, attempt = 0) {
   const to   = new Date();
-  const from = new Date(); from.setMonth(from.getMonth() - 7);
-  const url  = `https://api.polygon.io/v2/aggs/ticker/${sym}/range/1/day/`
+  const from = new Date(); from.setMonth(from.getMonth() - 4);
+  const url  = `https://api.polygon.io/v2/aggs/ticker/${sym}/range/1/hour/`
     + `${from.toISOString().split("T")[0]}/${to.toISOString().split("T")[0]}`
-    + `?adjusted=true&sort=asc&limit=200&apiKey=${apiKey}`;
+    + `?adjusted=true&sort=asc&limit=2000&apiKey=${apiKey}`;
   let res;
   try { res = await fetch(url); }
   catch { throw new Error(`Red — ${sym}`); }
   if (res.status === 429) {
-    if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetchHistoricalBars(sym, apiKey, attempt+1); }
+    if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetch1HBars(sym, apiKey, attempt+1); }
     throw new Error(`429 — ${sym}`);
   }
   if (!res.ok) throw new Error(`HTTP ${res.status} — ${sym}`);
   return (await res.json()).results || [];
 }
 
-// Hourly bars for the 3-month window — used for intraday WIN/LOSS detection
-async function fetchHourlyBars(sym, apiKey, attempt = 0) {
+// 15-minute bars — 3 months (condition 4 + WIN detection)
+async function fetch15MinBars(sym, apiKey, attempt = 0) {
   const to   = new Date();
   const from = new Date(); from.setMonth(from.getMonth() - 3);
-  const url  = `https://api.polygon.io/v2/aggs/ticker/${sym}/range/1/hour/`
+  const url  = `https://api.polygon.io/v2/aggs/ticker/${sym}/range/15/minute/`
     + `${from.toISOString().split("T")[0]}/${to.toISOString().split("T")[0]}`
     + `?adjusted=true&sort=asc&limit=5000&apiKey=${apiKey}`;
   let res;
   try { res = await fetch(url); }
   catch { throw new Error(`Red — ${sym}`); }
   if (res.status === 429) {
-    if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetchHourlyBars(sym, apiKey, attempt+1); }
+    if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetch15MinBars(sym, apiKey, attempt+1); }
     throw new Error(`429 — ${sym}`);
   }
   if (!res.ok) throw new Error(`HTTP ${res.status} — ${sym}`);
   return (await res.json()).results || [];
 }
 
-function buildDayDataBT(sym, bars, idx) {
-  if (idx < 50) return null;
-  const slice  = bars.slice(0, idx + 1);
-  const closes = slice.map(b => b.c);
-  const vols   = slice.map(b => b.v);
-  const last   = slice[slice.length - 1];
-  const prev   = slice[slice.length - 2];
-  const BB     = calcBB(closes);
-  const BBprev = calcBB(closes.slice(0, -1));
-  const ma20   = sma(closes, 20);
-  const ma40   = sma(closes, 40);
-  const ma50   = sma(closes, 50);
-  if (!BB || !ma20 || !ma40) return null;
-  const avgVol   = vols.slice(-20).reduce((a,b) => a+b, 0) / Math.min(20, vols.length);
-  const volLevel = BB.width < 3 ? "BAJA" : BB.width < 8 ? "ALTA" : "EXTREMA";
-  return {
-    sym, price: last.c, open: last.o, high: last.h, low: last.l, volume: last.v,
-    change: last.c - (prev?.c ?? last.c),
-    changePct: prev ? (last.c - prev.c) / prev.c * 100 : 0,
-    bb: BB, ma20, ma40, ma50, signal: calcSignal(last.c, BB, ma20, ma50),
-    gap: detectGap(slice.slice(-2)), bars: slice, avgVolume: avgVol,
-    prevLowVol: BBprev ? BBprev.width < 3 : false, volLevel,
-  };
-}
-
-// Returns auto-evaluatable condition IDs for a strategy (skips manual + gapTime)
-function getAutoCondIds(strat) {
-  const global = [
-    ...(strat.noHighVolRequired ? [] : ["vol"]),
-    "bbDir", "ma20Dir", "ma40Dir", "volume",
-  ];
-  const specific = strat.specific
-    .filter(c => c.type === "auto" && c.id !== "gapTime")
-    .map(c => c.id);
-  return [...global, ...specific];
-}
-
-// runBacktest(dailyData, hourlyData)
-// dailyData  — 7-month daily bars per symbol  (signal detection + MA/BB warmup)
-// hourlyData — 3-month hourly bars per symbol (intraday WIN detection)
-// No stop-loss: hold until WIN (target hit) or expiry (full LOSS of premium).
-// Weekday strike rule:
-//   Mon/Tue  → cheapest Ask in range (highest OTM%) → maxOtmPct
-//   Wed      → mid Ask (mid OTM%)
-//   Thu/Fri  → most expensive Ask in range (lowest OTM%) → minOtmPct
-function runBacktest(dailyData, hourlyData) {
-  const cutoff = new Date(); cutoff.setMonth(cutoff.getMonth() - 3);
+// ─── Backtest — Cambio de Tendencia (1H + 15min) ──────────────────────────────
+// E1 CALL: 1H downtrend (lower lows) → break up (close > recent highs) →
+//          MA20 cross up + bullish candle → 15min BB mid pointing up + price > mid
+//          → Volatilidad BB_1H > 2 %
+//          WIN = +1.5 % move in next 4 fifteen-min bars
+//
+// E2 PUT:  1H uptrend (higher highs) → break down (close < recent lows) →
+//          MA20 cross down + bearish candle → 15min BB mid pointing down + price < mid
+//          → Volatilidad BB_1H > 2 %
+//          WIN = −1.5 % move in next 4 fifteen-min bars
+function runBacktest(h1Data, m15Data) {
   const rawTrades = [];
-  let filteredCount = 0; // signals skipped because Ask was outside range
 
   for (const sym of BT_SYMS) {
-    const bars  = dailyData[sym];
-    const hBars = hourlyData[sym] || [];
-    const tk    = TICKER_MAP[sym];
-    if (!bars || bars.length < 55) continue;
+    const h1Bars  = h1Data[sym]  || [];
+    const m15Bars = m15Data[sym] || [];
+    if (h1Bars.length < 25 || m15Bars.length < 25) continue;
 
-    for (let i = 50; i < bars.length - 2; i++) {
-      const barDate = new Date(bars[i].t);
-      if (barDate < cutoff) continue;
-      const dow = barDate.getDay();
-      if (dow === 0 || dow === 6) continue;
+    for (let i = 22; i < h1Bars.length - 2; i++) {
+      const bar  = h1Bars[i];
+      const prev = h1Bars[i - 1];
 
-      const data = buildDayDataBT(sym, bars, i);
-      if (!data || data.volLevel === "BAJA") continue;
+      // ── 1H context ───────────────────────────────────────────────────────────
+      const closes1H = h1Bars.slice(0, i + 1).map(b => b.c);
+      const ma20_1H  = sma(closes1H, 20);
+      const bb1H     = calcBB(closes1H, 20);
+      if (!ma20_1H || !bb1H) continue;
 
-      const dateStr = barDate.toISOString().split("T")[0];
+      // Cond 5: BB width > 2% on 1H (high or extreme volatility)
+      if (bb1H.width <= 2) continue;
 
-      // Try every strategy — both CALL and PUT evaluated independently
-      for (const strat of STRATS) {
-        const condIds = getAutoCondIds(strat);
-        const autoRes = evalAuto(data, strat);
-        if (!condIds.every(id => autoRes[id]?.ok)) continue;
+      // Trend window: last 7 hourly bars BEFORE current bar
+      const tWin  = h1Bars.slice(Math.max(0, i - 6), i);
+      if (tWin.length < 4) continue;
+      const lows7  = tWin.map(b => b.l);
+      const highs7 = tWin.map(b => b.h);
 
-        // Signal confirmed → enter at next day's open
-        const nextBar = bars[i + 1];
-        if (!nextBar) continue;
-        const entry = nextBar.o;
+      // ── 15min context — find last bar at or before this 1H bar's close ───────
+      const m15Idx = findBarIndex(m15Bars, bar.t);
+      if (m15Idx < 22) continue;
 
-        // DTE rule: Friday signals → enter Monday, target NEXT Friday (4 calendar days from entry)
-        // All other weekdays → use standard DTES table
-        const dte = dow === 5 ? 4 : (dow >= 1 && dow <= 4 ? DTES[dow - 1] : 3);
+      const m15Cl    = m15Bars.slice(0, m15Idx + 1).map(b => b.c);
+      const m15BB    = calcBB(m15Cl, 20);
+      const m15BBpr  = calcBB(m15Cl.slice(0, -1), 20);
+      const m15Bar   = m15Bars[m15Idx];
+      if (!m15BB || !m15BBpr) continue;
 
-        // ── Option range filter (Kaizen rule: skip if Ask outside range) ────
-        // Estimate option Ask using OTM% based on weekday rule
-        let optAsk = null;
-        if (tk.range) {
-          const otmRange = getValidOtmRange(entry, tk.range, dte);
-          if (!otmRange) { filteredCount++; continue; } // no valid OTM in range
-          const [minOtm, maxOtm] = otmRange;
-          // Select OTM% by weekday: Mon/Tue=cheapest(maxOtm), Wed=mid, Thu/Fri=expensive(minOtm)
-          let otmPct;
-          if (dow <= 2) otmPct = maxOtm;           // Mon/Tue: cheapest
-          else if (dow === 3) otmPct = (minOtm + maxOtm) / 2; // Wed: mid
-          else otmPct = minOtm;                    // Thu/Fri: most expensive
-          optAsk = estimateOptionAsk(entry, otmPct, dte);
-          // Double-check it's in range (floating point safety)
-          if (optAsk < tk.range[0] || optAsk > tk.range[1]) { filteredCount++; continue; }
-        }
+      const dateStr = new Date(bar.t).toISOString().split("T")[0];
 
-        // ── Build intraday simulation bars ───────────────────────────────────
-        // Prefer hourly bars; fall back to daily H/L
-        const entryTs  = nextBar.t;
-        const expiryTs = entryTs + (dte + 1) * 24 * 60 * 60 * 1000;
-        const simBars  = hBars.filter(b => b.t >= entryTs && b.t <= expiryTs).length > 0
-          ? hBars.filter(b => b.t >= entryTs && b.t <= expiryTs)
-          : bars.slice(i + 1, i + 1 + dte + 2);
+      // ── E1: CALL — Cambio de Tendencia al Alza ───────────────────────────────
+      {
+        // Cond 1: 1H downtrend — lower lows in last 5-7 bars
+        const c1 = checkLowerLows(lows7);
+        // Cond 2: break of downtrend — close > highest high in trend window
+        const resistance = Math.max(...tWin.map(b => b.h));
+        const c2 = bar.c > resistance;
+        // Cond 3: crosses above MA20 on 1H, bullish candle, prev was below MA20
+        const c3 = bar.c > ma20_1H && bar.c > bar.o && prev.c < ma20_1H;
+        // Cond 4: 15min price > BB mid, BB mid pointing up
+        const c4 = m15Bar.c > m15BB.mid && m15BB.mid > m15BBpr.mid;
 
-        // Hold until WIN or expiry — no stop-loss
-        let outcome = "LOSS"; // default: expires worthless
-        for (const sb of simBars) {
-          if (strat.dir === "CALL") {
-            if (sb.high / entry - 1 >= BT_WIN_MOVE) { outcome = "WIN"; break; }
-          } else { // PUT
-            if (1 - sb.low / entry >= BT_WIN_MOVE)  { outcome = "WIN"; break; }
+        if (c1 && c2 && c3 && c4) {
+          const nextM15 = m15Idx + 1;
+          if (nextM15 >= m15Bars.length) continue;
+          const entry  = m15Bars[nextM15].o;
+          const target = entry * (1 + BT_WIN_MOVE_15M);
+          let outcome  = "LOSS";
+          for (let j = nextM15; j <= nextM15 + 3 && j < m15Bars.length; j++) {
+            if (m15Bars[j].h >= target) { outcome = "WIN"; break; }
           }
+          rawTrades.push({
+            id: `${sym}_call_${bar.t}`, date: dateStr, sym,
+            dir: "CALL", stratId: 1, stratName: "Cambio Tendencia ↑",
+            entry, outcome,
+          });
         }
+      }
 
-        rawTrades.push({
-          id: `${sym}_s${strat.id}_${dateStr}`,
-          date: dateStr, sym, stratId: strat.id, stratName: strat.name,
-          dir: strat.dir, entry, optAsk, outcome,
-          exitDate: new Date(expiryTs).toISOString().split("T")[0],
-        });
-        break; // one strategy per bar per ticker (first match wins)
+      // ── E2: PUT — Cambio de Tendencia a la Baja ──────────────────────────────
+      {
+        // Cond 1: 1H uptrend — higher highs in last 5-7 bars
+        const c1 = checkHigherHighs(highs7);
+        // Cond 2: break of uptrend — close < lowest low in trend window
+        const support = Math.min(...tWin.map(b => b.l));
+        const c2 = bar.c < support;
+        // Cond 3: crosses below MA20 on 1H, bearish candle, prev was above MA20
+        const c3 = bar.c < ma20_1H && bar.c < bar.o && prev.c > ma20_1H;
+        // Cond 4: 15min price < BB mid, BB mid pointing down
+        const c4 = m15Bar.c < m15BB.mid && m15BB.mid < m15BBpr.mid;
+
+        if (c1 && c2 && c3 && c4) {
+          const nextM15 = m15Idx + 1;
+          if (nextM15 >= m15Bars.length) continue;
+          const entry  = m15Bars[nextM15].o;
+          const target = entry * (1 - BT_WIN_MOVE_15M);
+          let outcome  = "LOSS";
+          for (let j = nextM15; j <= nextM15 + 3 && j < m15Bars.length; j++) {
+            if (m15Bars[j].l <= target) { outcome = "WIN"; break; }
+          }
+          rawTrades.push({
+            id: `${sym}_put_${bar.t}`, date: dateStr, sym,
+            dir: "PUT", stratId: 2, stratName: "Cambio Tendencia ↓",
+            entry, outcome,
+          });
+        }
       }
     }
   }
@@ -2383,53 +2369,30 @@ function runBacktest(dailyData, hourlyData) {
 
   let equity = BT_CAPITAL;
   const curve = [{ date: "Inicio", equity: BT_CAPITAL }];
-
   for (const t of rawTrades) {
     const invest = equity * BT_POS_PCT;
-
-    if (t.outcome === "WIN") {
-      t.pnl = invest * BT_WIN_PCT - BT_COMM;    // +35% of option premium invested
-    } else {
-      t.pnl = -invest - BT_COMM;                 // Full loss of option premium at expiry
-    }
-
+    t.pnl = t.outcome === "WIN" ? invest * BT_WIN_PCT - BT_COMM : -invest - BT_COMM;
     equity += t.pnl;
     curve.push({ date: t.date, equity });
   }
 
-  // Per-strategy summaries
-  const stratSums = STRATS.map(s => {
-    const st    = rawTrades.filter(t => t.stratId === s.id);
-    const wins  = st.filter(t => t.outcome === "WIN");
-    const pnls  = st.map(t => t.pnl ?? 0);
-    const tot   = pnls.reduce((a,b) => a+b, 0);
-    const best  = st.length ? st.reduce((b,t) => (t.pnl??-Infinity) > (b.pnl??-Infinity) ? t : b) : null;
-    const worst = st.length ? st.reduce((w,t) => (t.pnl??Infinity)  < (w.pnl??Infinity)  ? t : w) : null;
-    return {
-      id: s.id, name: s.name, dir: s.dir,
-      fires: st.length, wins: wins.length,
-      winPct: st.length ? wins.length / st.length * 100 : 0,
-      avgPnl: st.length ? tot / st.length : 0,
-      totalPnl: tot, best, worst,
-    };
-  });
-
-  // CALL vs PUT breakdown
   const callTrades = rawTrades.filter(t => t.dir === "CALL");
   const putTrades  = rawTrades.filter(t => t.dir === "PUT");
   const callWins   = callTrades.filter(t => t.outcome === "WIN").length;
   const putWins    = putTrades.filter(t => t.outcome === "WIN").length;
-  const callPnl    = callTrades.reduce((s,t) => s + (t.pnl??0), 0);
-  const putPnl     = putTrades.reduce((s,t)  => s + (t.pnl??0), 0);
+  const callPnl    = callTrades.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const putPnl     = putTrades.reduce((s, t)  => s + (t.pnl ?? 0), 0);
+  const totalWins  = rawTrades.filter(t => t.outcome === "WIN").length;
 
-  const totalWins = rawTrades.filter(t => t.outcome === "WIN").length;
   return {
-    trades: rawTrades, curve, stratSums, equity,
-    totalTrades: rawTrades.length, totalWins, filteredCount,
-    winRate: rawTrades.length ? totalWins / rawTrades.length * 100 : 0,
-    totalPnl: equity - BT_CAPITAL,
-    callTrades: callTrades.length, callWins, callPnl,
-    putTrades:  putTrades.length,  putWins,  putPnl,
+    trades: rawTrades, curve, equity,
+    totalTrades: rawTrades.length, totalWins,
+    winRate:     rawTrades.length   ? totalWins / rawTrades.length   * 100 : 0,
+    totalPnl:    equity - BT_CAPITAL,
+    callTrades:  callTrades.length, callWins, callPnl,
+    callWinRate: callTrades.length  ? callWins / callTrades.length   * 100 : 0,
+    putTrades:   putTrades.length,  putWins,  putPnl,
+    putWinRate:  putTrades.length   ? putWins  / putTrades.length    * 100 : 0,
   };
 }
 
@@ -2506,19 +2469,19 @@ function TabBacktest({ apiKey }) {
   const run = async () => {
     if (!apiKey) { setError("Necesitas configurar la API key de Polygon primero"); return; }
     setRunning(true); setError(null); setResults(null);
-    const daily  = {};
-    const hourly = {};
-    // All API calls: 4 daily + 4 hourly = 8 total; 15s between each
+    const h1Data  = {};
+    const m15Data = {};
+    // 4 symbols × 2 timeframes = 8 calls; 15s between each
     const allFetches = [
-      ...BT_SYMS.map(sym => ({ sym, type: "daily"  })),
-      ...BT_SYMS.map(sym => ({ sym, type: "hourly" })),
+      ...BT_SYMS.map(sym => ({ sym, type: "1h"  })),
+      ...BT_SYMS.map(sym => ({ sym, type: "15m" })),
     ];
     try {
       for (let i = 0; i < allFetches.length; i++) {
         const { sym, type } = allFetches[i];
-        setProgress(`${type === "daily" ? "Diario" : "Intradía 1h"} ${sym} (${i+1}/${allFetches.length})…`);
-        if (type === "daily")  daily[sym]  = await fetchHistoricalBars(sym, apiKey);
-        else                   hourly[sym] = await fetchHourlyBars(sym, apiKey);
+        setProgress(`${type === "1h" ? "1 Hora" : "15 Minutos"} ${sym} (${i+1}/${allFetches.length})…`);
+        if (type === "1h")  h1Data[sym]  = await fetch1HBars(sym, apiKey);
+        else                m15Data[sym] = await fetch15MinBars(sym, apiKey);
         if (i < allFetches.length - 1) {
           for (let s = 15; s >= 1; s--) {
             setProgress(`Esperando ${s}s — límite API… (${i+1}/${allFetches.length})`);
@@ -2526,17 +2489,17 @@ function TabBacktest({ apiKey }) {
           }
         }
       }
-      setProgress("Simulando 8 estrategias × 3 meses (CALL + PUT)…");
+      setProgress("Detectando señales de cambio de tendencia…");
       await new Promise(r => setTimeout(r, 50));
-      setResults(runBacktest(daily, hourly));
+      setResults(runBacktest(h1Data, m15Data));
     } catch(e) { setError(e.message); }
     setProgress(""); setRunning(false);
   };
 
   const filteredTrades = results?.trades.filter(t => {
-    if (filterSym     !== "all" && t.sym              !== filterSym)         return false;
-    if (filterStrat   !== "all" && String(t.stratId)  !== filterStrat)       return false;
-    if (filterOutcome !== "all" && t.outcome           !== filterOutcome)     return false;
+    if (filterSym     !== "all" && t.sym              !== filterSym)     return false;
+    if (filterStrat   !== "all" && String(t.stratId)  !== filterStrat)   return false;
+    if (filterOutcome !== "all" && t.outcome           !== filterOutcome) return false;
     return true;
   }) ?? [];
 
@@ -2556,11 +2519,11 @@ function TabBacktest({ apiKey }) {
 
       {/* Methodology note */}
       <div className="bg-slate-800/60 border border-slate-700/40 rounded-xl px-3 py-2.5 space-y-0.5">
-        <div className="text-slate-300 text-xs font-semibold mb-1">Metodología</div>
-        <div className="text-slate-500 text-xs">• TSLA · GOOGL · MSFT · META — señales en datos diarios (7m) + simulación en barras 1h (3m)</div>
-        <div className="text-slate-500 text-xs">• CALL gana si precio SUBE ≥2.5 % · PUT gana si precio BAJA ≥2.5 % — ambas direcciones válidas</div>
-        <div className="text-slate-500 text-xs">• Capital $10,000 · 5 % por trade · Plan 35 % objetivo / Stop −20 %</div>
-        <div className="text-slate-500 text-xs">• Neutros: P&L real según movimiento final × 3.5x leverage (sin penalización fija)</div>
+        <div className="text-slate-300 text-xs font-semibold mb-1">Estrategia: Cambio de Tendencia (datos 1H + 15min)</div>
+        <div className="text-slate-500 text-xs">• E1 CALL: tendencia bajista 1H → ruptura MA20 al alza + 15min alcista</div>
+        <div className="text-slate-500 text-xs">• E2 PUT: tendencia alcista 1H → ruptura MA20 a la baja + 15min bajista</div>
+        <div className="text-slate-500 text-xs">• WIN = +1.5% en dirección correcta en las siguientes 4 velas de 15min</div>
+        <div className="text-slate-500 text-xs">• TSLA · GOOGL · MSFT · META · Capital $10,000 · 5% por trade · Plan 35%</div>
       </div>
 
       {/* Progress */}
@@ -2578,23 +2541,16 @@ function TabBacktest({ apiKey }) {
 
       {results && (
         <>
-          {/* Methodology note */}
-          <div className="bg-slate-800/60 rounded-xl px-3 py-2.5 border border-slate-700/40 text-xs text-slate-400 space-y-0.5">
-            <div className="font-bold text-slate-300">Metodología Kaizen — sin stop loss</div>
-            <div>WIN: acción mueve +2.5% en dirección correcta → +35% premium</div>
-            <div>LOSS: no llega al objetivo → expira sin valor (−100% premium)</div>
-            {results.filteredCount > 0 && (
-              <div className="text-yellow-500">⚠ {results.filteredCount} señales filtradas por Ask fuera del rango óptimo</div>
-            )}
-          </div>
-
           {/* Summary cards */}
           <div className="grid grid-cols-2 gap-2">
             {[
-              ["Trades totales",  results.totalTrades,                                      "text-white"],
-              ["Tasa de acierto", results.totalTrades ? results.winRate.toFixed(1)+"%" : "—", results.winRate >= 50 ? "text-green-400" : "text-red-400"],
-              ["Capital final",   `$${Math.round(results.equity).toLocaleString()}`,          results.equity >= BT_CAPITAL ? "text-green-400" : "text-red-400"],
-              ["P&L total",       `${results.totalPnl>=0?"+":""}$${Math.round(results.totalPnl)}`, results.totalPnl >= 0 ? "text-green-400" : "text-red-400"],
+              ["Señales totales", results.totalTrades, "text-white"],
+              ["Acierto global",  results.totalTrades ? results.winRate.toFixed(1)+"%" : "—",
+               results.winRate >= 50 ? "text-green-400" : "text-red-400"],
+              ["Capital final",   `$${Math.round(results.equity).toLocaleString()}`,
+               results.equity >= BT_CAPITAL ? "text-green-400" : "text-red-400"],
+              ["P&L simulado",    `${results.totalPnl>=0?"+":""}$${Math.round(results.totalPnl)}`,
+               results.totalPnl >= 0 ? "text-green-400" : "text-red-400"],
             ].map(([lbl,val,cls]) => (
               <div key={lbl} className="bg-slate-800 rounded-xl px-3 py-3 text-center border border-slate-700/40">
                 <div className="text-slate-500 text-xs mb-0.5">{lbl}</div>
@@ -2603,41 +2559,29 @@ function TabBacktest({ apiKey }) {
             ))}
           </div>
 
-          {/* CALL vs PUT breakdown */}
+          {/* E1 CALL vs E2 PUT breakdown */}
           <div className="bg-slate-800 rounded-2xl p-3 border border-slate-700/60">
-            <div className="text-slate-400 text-xs font-bold mb-2 uppercase tracking-wider">CALL vs PUT</div>
+            <div className="text-slate-400 text-xs font-bold mb-2 uppercase tracking-wider">Resultado por Estrategia</div>
             <div className="grid grid-cols-3 gap-2 text-xs">
               {[
-                {
-                  label: "🟢 CALL",
-                  trades: results.callTrades,
-                  wins:   results.callWins,
-                  pnl:    results.callPnl,
-                  color:  results.callPnl >= 0 ? "text-green-400" : "text-red-400",
-                  border: "border-green-900/40",
-                },
-                {
-                  label: "🔴 PUT",
-                  trades: results.putTrades,
-                  wins:   results.putWins,
-                  pnl:    results.putPnl,
-                  color:  results.putPnl >= 0 ? "text-green-400" : "text-red-400",
-                  border: "border-red-900/40",
-                },
-                {
-                  label: "⚖️ Total",
-                  trades: results.totalTrades,
-                  wins:   results.totalWins,
-                  pnl:    results.totalPnl,
-                  color:  results.totalPnl >= 0 ? "text-green-400" : "text-red-400",
-                  border: "border-slate-600/40",
-                },
+                { label:"E1 CALL ↑", trades:results.callTrades, wins:results.callWins,
+                  wr:results.callWinRate, pnl:results.callPnl, border:"border-green-900/40",
+                  desc:"Cambio tend. alza" },
+                { label:"E2 PUT ↓",  trades:results.putTrades,  wins:results.putWins,
+                  wr:results.putWinRate,  pnl:results.putPnl,  border:"border-red-900/40",
+                  desc:"Cambio tend. baja" },
+                { label:"Total",      trades:results.totalTrades, wins:results.totalWins,
+                  wr:results.winRate,     pnl:results.totalPnl,   border:"border-slate-600/40",
+                  desc:"Combinado" },
               ].map(row => (
                 <div key={row.label} className={`bg-slate-700/40 rounded-xl px-2.5 py-2.5 border ${row.border}`}>
-                  <div className="text-slate-300 font-bold text-xs mb-1">{row.label}</div>
-                  <div className="text-slate-400">{row.trades} trades</div>
-                  <div className="text-slate-400">{row.trades ? (row.wins/row.trades*100).toFixed(0) : 0}% win</div>
-                  <div className={`font-bold mt-1 ${row.color}`}>
+                  <div className="text-slate-200 font-bold text-xs">{row.label}</div>
+                  <div className="text-slate-500 text-xs mb-1">{row.desc}</div>
+                  <div className="text-slate-400">{row.trades} señales</div>
+                  <div className={`font-black text-base mt-0.5 ${row.wr>=50?"text-green-400":row.wr>0?"text-yellow-400":"text-slate-600"}`}>
+                    {row.trades ? row.wr.toFixed(0)+"%" : "—"}
+                  </div>
+                  <div className={`text-xs mt-0.5 font-bold ${row.pnl>=0?"text-green-400":"text-red-400"}`}>
                     {row.pnl>=0?"+":""}${Math.round(row.pnl)}
                   </div>
                 </div>
@@ -2645,116 +2589,50 @@ function TabBacktest({ apiKey }) {
             </div>
           </div>
 
+          {/* Conditions legend */}
+          <div className="bg-slate-800 rounded-2xl p-3 border border-slate-700/60 space-y-2">
+            <div className="text-slate-400 text-xs font-bold uppercase tracking-wider">Condiciones evaluadas</div>
+            {[
+              { dir:"CALL", color:"text-green-400", bg:"bg-green-900/20",
+                conds:["C1: Tendencia bajista 1H (mínimos más bajos)",
+                       "C2: Rompe resistencia (cierre > máximos recientes)",
+                       "C3: Cruza MA20 al alza con vela alcista",
+                       "C4: 15min — precio > BB media y BB media apunta arriba",
+                       "C5: BB ancho 1H > 2% (volatilidad alta)"] },
+              { dir:"PUT",  color:"text-red-400",   bg:"bg-red-900/20",
+                conds:["C1: Tendencia alcista 1H (máximos más altos)",
+                       "C2: Rompe soporte (cierre < mínimos recientes)",
+                       "C3: Cruza MA20 a la baja con vela bajista",
+                       "C4: 15min — precio < BB media y BB media apunta abajo",
+                       "C5: BB ancho 1H > 2% (volatilidad alta)"] },
+            ].map(s => (
+              <div key={s.dir} className={`${s.bg} rounded-xl px-3 py-2`}>
+                <div className={`font-bold text-xs mb-1 ${s.color}`}>{s.dir}</div>
+                {s.conds.map((c,i) => (
+                  <div key={i} className="text-slate-400 text-xs">{c}</div>
+                ))}
+              </div>
+            ))}
+          </div>
+
           {/* Equity curve */}
           <div className="bg-slate-800 rounded-2xl p-3 border border-slate-700/60">
-            <div className="text-slate-400 text-xs font-bold mb-2 uppercase tracking-wider">Curva de Equity</div>
+            <div className="text-slate-400 text-xs font-bold mb-2 uppercase tracking-wider">Curva de Equity Simulada</div>
             <EquityChart curve={results.curve}/>
           </div>
-
-          {/* Strategy summary table */}
-          <div className="bg-slate-800 rounded-2xl border border-slate-700/60 overflow-hidden">
-            <div className="px-4 py-3 border-b border-slate-700/40">
-              <div className="text-slate-300 font-semibold text-sm">Resumen por Estrategia</div>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="border-b border-slate-700/40 text-slate-500">
-                    <th className="text-left px-3 py-2 font-semibold">Estrategia</th>
-                    <th className="text-center px-2 py-2 font-semibold">Señales</th>
-                    <th className="text-center px-2 py-2 font-semibold">Éxito</th>
-                    <th className="text-center px-2 py-2 font-semibold">Avg $</th>
-                    <th className="text-right px-3 py-2 font-semibold">P&L</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {results.stratSums.map(s => (
-                    <tr key={s.id} className="border-b border-slate-700/20 last:border-0">
-                      <td className="px-3 py-2.5">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-slate-400 font-bold">E{s.id}</span>
-                          <span className={`text-xs px-1 py-0.5 rounded font-bold
-                            ${s.dir==="CALL"?"bg-green-900/50 text-green-400":"bg-red-900/50 text-red-400"}`}>
-                            {s.dir}
-                          </span>
-                        </div>
-                        <div className="text-slate-600 text-xs truncate" style={{maxWidth:110}}>{s.name}</div>
-                      </td>
-                      <td className="text-center px-2 py-2.5">
-                        {s.fires > 0 ? (
-                          <>
-                            <div className="text-white font-bold">{s.fires}</div>
-                            <div className="text-slate-600">{s.wins}W·{s.fires-s.wins}L</div>
-                          </>
-                        ) : <span className="text-slate-700">—</span>}
-                      </td>
-                      <td className="text-center px-2 py-2.5">
-                        {s.fires > 0 ? (
-                          <span className={`font-bold text-sm
-                            ${s.winPct>=55?"text-green-400":s.winPct>=45?"text-yellow-400":"text-red-400"}`}>
-                            {s.winPct.toFixed(0)}%
-                          </span>
-                        ) : <span className="text-slate-700">—</span>}
-                      </td>
-                      <td className="text-center px-2 py-2.5">
-                        {s.fires > 0 ? (
-                          <span className={`font-bold ${s.avgPnl>=0?"text-green-400":"text-red-400"}`}>
-                            {s.avgPnl>=0?"+":""}${s.avgPnl.toFixed(0)}
-                          </span>
-                        ) : <span className="text-slate-700">—</span>}
-                      </td>
-                      <td className="text-right px-3 py-2.5">
-                        {s.fires > 0 ? (
-                          <span className={`font-bold ${s.totalPnl>=0?"text-green-400":"text-red-400"}`}>
-                            {s.totalPnl>=0?"+":""}${Math.round(s.totalPnl)}
-                          </span>
-                        ) : <span className="text-slate-700">—</span>}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* Best / worst highlights */}
-          {results.stratSums.some(s => s.best || s.worst) && (
-            <div className="bg-slate-800 rounded-2xl p-4 border border-slate-700/60 space-y-2">
-              <div className="text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Mejores & Peores trades</div>
-              {results.stratSums.filter(s => s.best || s.worst).map(s => (
-                <div key={s.id} className="grid grid-cols-2 gap-2 text-xs">
-                  {s.best && (
-                    <div className="bg-green-900/20 border border-green-900/40 rounded-xl px-2.5 py-2">
-                      <div className="text-green-400 font-bold">↑ Mejor E{s.id}</div>
-                      <div className="text-slate-400">{s.best.sym} {s.best.date}</div>
-                      <div className="text-green-300 font-mono">+${s.best.pnl?.toFixed(0)}</div>
-                    </div>
-                  )}
-                  {s.worst && (
-                    <div className="bg-red-900/20 border border-red-900/40 rounded-xl px-2.5 py-2">
-                      <div className="text-red-400 font-bold">↓ Peor E{s.id}</div>
-                      <div className="text-slate-400">{s.worst.sym} {s.worst.date}</div>
-                      <div className="text-red-300 font-mono">${s.worst.pnl?.toFixed(0)}</div>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
 
           {/* Trades list (collapsible) */}
           <div className="bg-slate-800 rounded-2xl border border-slate-700/60 overflow-hidden">
             <button onClick={() => setShowTrades(v => !v)}
               className="w-full px-4 py-3 flex justify-between items-center">
               <span className="text-slate-300 font-semibold text-sm">
-                Lista de trades ({filteredTrades.length})
+                Lista de señales ({filteredTrades.length})
               </span>
               <span className="text-slate-600 text-xs">{showTrades ? "▲" : "▼"}</span>
             </button>
 
             {showTrades && (
               <>
-                {/* Filters */}
                 <div className="px-3 py-2 border-t border-b border-slate-700/40 flex gap-1.5 flex-wrap">
                   <select value={filterSym} onChange={e => setFilterSym(e.target.value)}
                     className="bg-slate-700 text-slate-300 text-xs rounded-lg px-2 py-1.5 border-0 focus:outline-none">
@@ -2764,44 +2642,42 @@ function TabBacktest({ apiKey }) {
                   <select value={filterStrat} onChange={e => setFilterStrat(e.target.value)}
                     className="bg-slate-700 text-slate-300 text-xs rounded-lg px-2 py-1.5 border-0 focus:outline-none">
                     <option value="all">Todas las estrategias</option>
-                    {STRATS.map(s => <option key={s.id} value={String(s.id)}>E{s.id} — {s.name}</option>)}
+                    <option value="1">E1 — Cambio Tendencia ↑ CALL</option>
+                    <option value="2">E2 — Cambio Tendencia ↓ PUT</option>
                   </select>
                   <select value={filterOutcome} onChange={e => setFilterOutcome(e.target.value)}
                     className="bg-slate-700 text-slate-300 text-xs rounded-lg px-2 py-1.5 border-0 focus:outline-none">
                     <option value="all">Todos</option>
                     <option value="WIN">WIN ✓</option>
                     <option value="LOSS">LOSS ✗</option>
-                    <option value="NEUTRAL">NEUTRAL</option>
                   </select>
                 </div>
 
                 <div className="max-h-80 overflow-y-auto divide-y divide-slate-700/20">
                   {filteredTrades.length === 0 ? (
-                    <div className="text-center text-slate-600 text-xs py-8">Sin trades con estos filtros</div>
-                  ) : (
-                    filteredTrades.map(t => (
-                      <div key={t.id} className="px-3 py-2.5 flex items-center gap-2">
-                        <span className={`shrink-0 text-xs px-1.5 py-0.5 rounded font-bold
-                          ${t.outcome==="WIN"?"bg-green-900/60 text-green-400"
-                            :t.outcome==="LOSS"?"bg-red-900/60 text-red-400"
-                            :"bg-slate-700 text-slate-500"}`}>
-                          {t.outcome}
-                        </span>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex justify-between items-baseline">
-                            <span className="text-white font-bold text-xs">{t.sym}</span>
-                            <span className="text-slate-600 text-xs">{t.date}</span>
-                          </div>
-                          <div className="text-slate-500 text-xs truncate">
-                            E{t.stratId} {t.dir} · entrada ${parseFloat(t.entry).toFixed(2)} · salida ${parseFloat(t.exitPrice).toFixed(2)}
-                          </div>
+                    <div className="text-center text-slate-600 text-xs py-8">Sin señales con estos filtros</div>
+                  ) : filteredTrades.map(t => (
+                    <div key={t.id} className="px-3 py-2.5 flex items-center gap-2">
+                      <span className={`shrink-0 text-xs px-1.5 py-0.5 rounded font-bold
+                        ${t.outcome==="WIN"?"bg-green-900/60 text-green-400":"bg-red-900/60 text-red-400"}`}>
+                        {t.outcome}
+                      </span>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex justify-between items-baseline">
+                          <span className={`font-bold text-xs ${t.dir==="CALL"?"text-green-400":"text-red-400"}`}>
+                            {t.sym} {t.dir}
+                          </span>
+                          <span className="text-slate-600 text-xs">{t.date}</span>
                         </div>
-                        <span className={`shrink-0 font-mono font-bold text-xs ${(t.pnl??0)>=0?"text-green-400":"text-red-400"}`}>
-                          {(t.pnl??0)>=0?"+":""}${Math.round(t.pnl??0)}
-                        </span>
+                        <div className="text-slate-500 text-xs truncate">
+                          {t.stratName} · entrada ${parseFloat(t.entry).toFixed(2)}
+                        </div>
                       </div>
-                    ))
-                  )}
+                      <span className={`shrink-0 font-mono font-bold text-xs ${(t.pnl??0)>=0?"text-green-400":"text-red-400"}`}>
+                        {(t.pnl??0)>=0?"+":""}${Math.round(t.pnl??0)}
+                      </span>
+                    </div>
+                  ))}
                 </div>
               </>
             )}
