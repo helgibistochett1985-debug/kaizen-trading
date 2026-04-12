@@ -1077,8 +1077,16 @@ function TabCheck({ market }) {
   const bidAskPct = bid && ask ? (parseFloat(ask)-parseFloat(bid))/parseFloat(bid)*100 : null;
   const bidAskOk  = bidAskPct != null && bidAskPct <= 5;
 
-  const dow    = new Date().getDay();  // 0=Sun 1=Mon ... 6=Sat
-  const todayDTE = dow>=1&&dow<=5 ? DTES[dow-1] : null;
+  const etCheck  = getETNow();
+  const dow      = etCheck.getDay();   // 0=Sun 1=Mon … 5=Fri … 6=Sat
+  const isPMCheck = etCheck.getHours() >= 12;
+  // DTE with Friday 12pm + same-day exception
+  const todayDTE = (() => {
+    if (dow < 1 || dow > 5) return null;
+    if (dow === 5 && isPMCheck) return null; // Friday after 12pm → next week (shown as warning)
+    return DTES[dow - 1];
+  })();
+  const fridayPMWarn = dow === 5 && isPMCheck;
 
   const gapAuto = d?.gap;
 
@@ -1287,9 +1295,16 @@ function TabCheck({ market }) {
             </div>
           ))}
         </div>
-        {todayDTE && (
+        {fridayPMWarn ? (
+          <div className="text-xs text-amber-400 mb-2 font-bold bg-amber-900/20 rounded-lg px-2 py-1.5">
+            ⚠ Viernes &gt;12pm — elegir expiración de la SEMANA SIGUIENTE
+          </div>
+        ) : todayDTE && (
           <div className="text-xs text-blue-400 mb-2 font-medium">
             Hoy {DAYS[dow-1]}: DTE recomendado = {todayDTE} días
+            {isPMCheck && todayDTE <= 1 && (
+              <span className="text-amber-400 ml-1">— ya &gt;12pm, verificar que no sea expiración hoy</span>
+            )}
           </div>
         )}
         <div className="grid grid-cols-2 gap-2">
@@ -1362,6 +1377,23 @@ function TabCalc({ market }) {
   // inRange: user-entered Ask price vs option contract range (correct comparison)
   const inRange = tk.range && E>0 ? E>=tk.range[0] && E<=tk.range[1] : null;
 
+  // DTE recommendation with Friday 12pm exception
+  const etNowCalc = getETNow();
+  const dowCalc   = etNowCalc.getDay();
+  const isPMCalc  = etNowCalc.getHours() >= 12;
+  const { dteRec, dteNote, dteWarn } = (() => {
+    if (dowCalc === 5 && isPMCalc)
+      return { dteRec: 7, dteNote: "Viernes >12pm → expiración SEMANA SIGUIENTE (~7 días)", dteWarn: true };
+    if (dowCalc >= 1 && dowCalc <= 5) {
+      const base = DTES[dowCalc - 1];
+      const sameDay = base === 0 || (base === 1 && isPMCalc);
+      if (sameDay)
+        return { dteRec: DTES[Math.min(dowCalc, 4)], dteNote: "Expiración hoy >12pm → elegir siguiente fecha disponible", dteWarn: true };
+      return { dteRec: base, dteNote: `${DAYS[dowCalc-1]}: DTE ${base} días`, dteWarn: false };
+    }
+    return { dteRec: null, dteNote: "Mercado cerrado (fin de semana)", dteWarn: false };
+  })();
+
   return (
     <div className="space-y-4">
       <h2 className="text-white font-bold">Calculadora de Objetivos</h2>
@@ -1383,6 +1415,22 @@ function TabCalc({ market }) {
             </button>
           ))}
         </div>
+
+        {/* DTE recommendation */}
+        {dteRec !== null && (
+          <div className={`flex justify-between items-center text-xs px-3 py-2 rounded-xl border
+            ${dteWarn ? "bg-amber-900/30 border-amber-700/50" : "bg-slate-700/50 border-slate-600/50"}`}>
+            <div>
+              <div className={`font-bold ${dteWarn ? "text-amber-300" : "text-slate-300"}`}>
+                {dteWarn ? "⚠ " : ""}Expiración recomendada
+              </div>
+              <div className={`mt-0.5 ${dteWarn ? "text-amber-400/80" : "text-slate-500"}`}>{dteNote}</div>
+            </div>
+            <div className={`font-black text-2xl ${dteWarn ? "text-amber-300" : "text-blue-400"}`}>
+              {dteRec}d
+            </div>
+          </div>
+        )}
 
         {/* Range badge — shows optimal Ask range for this ticker's contract */}
         {tk.range && (
@@ -1706,6 +1754,40 @@ function getETNow() {
   return new Date(new Date().toLocaleString("en-US", { timeZone: "America/New_York" }));
 }
 
+// Returns today's date string in ET timezone (YYYY-MM-DD)
+function getETDateStr(etNow) {
+  const yy = etNow.getFullYear();
+  const mm = String(etNow.getMonth() + 1).padStart(2, "0");
+  const dd = String(etNow.getDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
+}
+
+// Kaizen expiry selection rule:
+//   - Always pick nearest available expiration
+//   - Exception 1: same-day expiry after 12pm ET → skip to next date
+//   - Exception 2: Friday after 12pm ET → skip entire week, go to next week
+function pickExpiry(exps, etNow) {
+  if (!exps?.length) return null;
+  const todayStr = getETDateStr(etNow);
+  const hour  = etNow.getHours();
+  const dow   = etNow.getDay(); // 0=Sun … 5=Fri … 6=Sat
+  const isPM  = hour >= 12;
+
+  for (const exp of exps) {
+    // Days from today to this expiry (calendar days, UTC noon-to-noon to avoid DST issues)
+    const daysOut = Math.round(
+      (new Date(exp + "T12:00:00Z") - new Date(todayStr + "T12:00:00Z")) / 86400000
+    );
+    // Exception 1: same-day expiry (0DTE) after 12pm → skip
+    if (daysOut <= 0 && isPM) continue;
+    // Exception 2: Friday after 12pm → only accept expiry 7+ days out (next week)
+    if (dow === 5 && isPM && daysOut < 7) continue;
+    return exp;
+  }
+  // Fallback: last available expiry
+  return exps[exps.length - 1];
+}
+
 // OTM % by weekday: Mon/Tue=5%, Wed=2.5%, Thu/Fri=1%
 function otmPctByDow(dow) {
   if (dow === 1 || dow === 2) return 0.05;
@@ -1802,10 +1884,14 @@ function TabBot({ market, selectedTickers, apiKey }) {
 
         addLog(`🟢 ${sym} E${strat.id} ${strat.name} — señal confirmada, ejecutando ${strat.dir}…`, "success");
         try {
-          // Nearest expiration
+          const etNow = getETNow();
+          const dow   = etNow.getDay();
+
+          // Nearest valid expiration (Kaizen rule: nearest, skip same-day after 12pm, skip week if Friday after 12pm)
           const exps = await trGetExpirations(t, sym);
           if (!exps.length) { addLog(`${sym}: sin vencimientos disponibles`, "error"); break; }
-          const expDate = exps[0];
+          const expDate = pickExpiry(exps, etNow);
+          if (!expDate) { addLog(`${sym}: sin vencimiento válido (regla horario)`, "error"); break; }
 
           // Options chain
           const chain = await trGetChain(t, sym, expDate);
@@ -1814,8 +1900,6 @@ function TabBot({ market, selectedTickers, apiKey }) {
           if (!filtered.length) { addLog(`${sym}: cadena de opciones vacía`, "error"); break; }
 
           // Target strike by OTM %
-          const etNow    = getETNow();
-          const dow      = etNow.getDay();
           const otmPct   = otmPctByDow(dow);
           const rawTgt   = strat.dir === "CALL" ? data.price * (1 + otmPct) : data.price * (1 - otmPct);
           const tgtStrike = Math.round(rawTgt * 2) / 2;
@@ -2244,7 +2328,9 @@ function runBacktest(dailyData, hourlyData) {
         if (!nextBar) continue;
         const entry = nextBar.o;
 
-        const dte = dow >= 1 && dow <= 5 ? DTES[dow - 1] : 3;
+        // DTE rule: Friday signals → enter Monday, target NEXT Friday (4 calendar days from entry)
+        // All other weekdays → use standard DTES table
+        const dte = dow === 5 ? 4 : (dow >= 1 && dow <= 4 ? DTES[dow - 1] : 3);
 
         // ── Option range filter (Kaizen rule: skip if Ask outside range) ────
         // Estimate option Ask using OTM% based on weekday rule
@@ -2792,7 +2878,13 @@ function TabRef() {
           ["Martes","DTE 4 días"],
           ["Miércoles","DTE 3 días"],
           ["Jueves","DTE 2 días"],
-          ["Viernes","DTE 1 día"],
+          ["Viernes","DTE 1 día (antes 12pm) / SEMANA SIGUIENTE (después 12pm)"],
+        ]},
+        { title:"Regla de Expiración", color:"text-amber-400", bullets:[
+          "Siempre elegir la fecha MÁS CERCANA disponible",
+          "Viernes >12pm ET → elegir expiración de SEMANA SIGUIENTE",
+          "Misma fecha de expiración >12pm ET → elegir la siguiente fecha",
+          "Más cercana = se valoriza más rápido, más barata, más dentro del rango",
         ]},
       ].map(sec=>(
         <div key={sec.title} className="bg-slate-800 rounded-2xl p-4 border border-slate-700/60">
