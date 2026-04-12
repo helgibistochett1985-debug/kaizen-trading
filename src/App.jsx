@@ -2300,10 +2300,12 @@ function getDailyCtx(dailyBars, hourlyTs) {
   const bb      = calcBB(closes, 20);
   const bbPrev  = calcBB(closes.slice(0, -1), 20);
   if (!bb || !bbPrev) return null;
+  const bbMidSlope = (bb.mid - bbPrev.mid) / bbPrev.mid; // relative daily PM slope
   return {
     bbMid:       bb.mid,
-    bbMidUp:     bb.mid > bbPrev.mid,        // BB mid pointing up
-    priceAbove:  dailyBars[idx].c > bb.mid,  // daily close above BB mid
+    bbMidUp:     bb.mid > bbPrev.mid,
+    bbMidSlope,                              // >0 rising, <0 falling, ≈0 lateral
+    priceAbove:  dailyBars[idx].c > bb.mid,
   };
 }
 
@@ -2338,11 +2340,12 @@ function runBacktest(h1Data, m15Data, dailyData) {
       const bb1HPrev = calcBB(closes1H.slice(0, -1), 20);
       if (!ma20_1H || !ma40_1H || !bb1H || !bb1HPrev) continue;
 
-      // Trend window: last 7 hourly bars BEFORE current bar
-      const tWin  = h1Bars.slice(Math.max(0, i - 6), i);
-      if (tWin.length < 4) continue;
-      const lows7  = tWin.map(b => b.l);
-      const highs7 = tWin.map(b => b.h);
+      // Trend window: last 13 hourly bars BEFORE current bar (≈ 2 trading days)
+      // Global rule: min 2 days of trend required for E1/E2 (strategy 5/6 exempt)
+      const tWin   = h1Bars.slice(Math.max(0, i - 13), i);
+      if (tWin.length < 7) continue;
+      const lows13  = tWin.map(b => b.l);
+      const highs13 = tWin.map(b => b.h);
 
       // ── 15min context — find last bar at or before this 1H bar's close ───────
       const m15Idx = findBarIndex(m15Bars, bar.t);
@@ -2377,96 +2380,102 @@ function runBacktest(h1Data, m15Data, dailyData) {
       };
 
       // ── E1: CALL — Cambio de Tendencia al Alza ───────────────────────────────
-      // C5 global: BB width 1H > 2%
+      // Global rules: ≥2 days trend (13 1H bars), BB width >2%, DAY→HORA→15min order
       if (bb1H.width > 2) {
-        const c1 = checkLowerLows(lows7);                               // 1H downtrend
-        const c2 = bar.c > Math.max(...tWin.map(b => b.h));            // breaks resistance
+        const c1 = checkLowerLows(lows13);                                // ≥2d downtrend 1H
+        const c2 = bar.c > Math.max(...tWin.map(b => b.h));              // breaks resistance
         const c3 = bar.c > ma20_1H && bar.c > bar.o && prev.c < ma20_1H; // MA20 cross up
-        const c4 = m15Bar.c > m15BB.mid && m15BB.mid > m15BBpr.mid;    // 15min bullish
+        const c4 = m15Bar.c > m15BB.mid && m15BB.mid > m15BBpr.mid;      // 15min BB bullish
         if (c1 && c2 && c3 && c4) tryTrade("CALL", 1, "Cambio Tend. ↑");
       }
 
       // ── E2: PUT — Cambio de Tendencia a la Baja ──────────────────────────────
       if (bb1H.width > 2) {
-        const c1 = checkHigherHighs(highs7);                            // 1H uptrend
-        const c2 = bar.c < Math.min(...tWin.map(b => b.l));            // breaks support
+        const c1 = checkHigherHighs(highs13);                             // ≥2d uptrend 1H
+        const c2 = bar.c < Math.min(...tWin.map(b => b.l));              // breaks support
         const c3 = bar.c < ma20_1H && bar.c < bar.o && prev.c > ma20_1H; // MA20 cross down
-        const c4 = m15Bar.c < m15BB.mid && m15BB.mid < m15BBpr.mid;    // 15min bearish
+        const c4 = m15Bar.c < m15BB.mid && m15BB.mid < m15BBpr.mid;      // 15min BB bearish
         if (c1 && c2 && c3 && c4) tryTrade("PUT", 2, "Cambio Tend. ↓");
       }
 
       // ── E3: PUT — Rebote Punto Medio a la Baja ───────────────────────────────
-      // Requires daily bars for BB mid context
+      // Global rules: DAY bearish trend (≥2d) + PM NOT lateral + 1H volatility
       if (dayCtx) {
-        // C1: Daily BEARISH trend (BB mid pointing down, price below daily BB mid)
-        const c1 = !dayCtx.bbMidUp && !dayCtx.priceAbove;
-        // C2: 1H BULLISH (hourly rally toward daily BB mid — price above 1H BB mid)
+        // PM lateral guard: daily BB mid must be moving (slope > 0.03%/day)
+        const pmNotLateral = Math.abs(dayCtx.bbMidSlope) > 0.0003;
+        // C1: DIA BAJISTA — BB mid falling, price below daily BB mid, PM not lateral
+        const c1 = !dayCtx.bbMidUp && !dayCtx.priceAbove && pmNotLateral;
+        // C1b: 1H has some volatility (strategy needs movement)
+        const cVol = bb1H.width > 1.0;
+        // C2: 1H BULLISTA (rally hacia PM diario — precio sobre BB media 1H)
         const c2 = bar.c > bb1H.mid && bb1H.mid > bb1HPrev.mid;
-        // C3+C4: Price approached daily BB mid from below, touched it but didn't close above
-        //   high reached daily BB mid (within 0.3%), close stayed below BB mid
-        const distUp  = (bar.h - dayCtx.bbMid) / dayCtx.bbMid;
-        const c3c4    = distUp >= -0.003 && distUp <= 0.005 && bar.c < dayCtx.bbMid;
-        // C5: 15min turning bearish + 1H candle bearish (confirmation)
+        // C3+C4: Price touched daily BB mid from below (within ±0.3%), closed below
+        const distUp = (bar.h - dayCtx.bbMid) / dayCtx.bbMid;
+        const c3c4   = distUp >= -0.003 && distUp <= 0.005 && bar.c < dayCtx.bbMid;
+        // C5: Vela confirmación 1H bajista + 15min bajista
         const c5 = bar.c < bar.o && m15Bar.c < m15Bar.o;
-        if (c1 && c2 && c3c4 && c5) tryTrade("PUT", 3, "Rebote PM ↓", 8);
+        if (c1 && cVol && c2 && c3c4 && c5) tryTrade("PUT", 3, "Rebote PM ↓", 8);
       }
 
       // ── E4: CALL — Rebote Punto Medio al Alza ────────────────────────────────
       if (dayCtx) {
-        // C1: Daily BULLISH trend (BB mid pointing up, price above daily BB mid)
-        const c1 = dayCtx.bbMidUp && dayCtx.priceAbove;
-        // C2: 1H BEARISH (hourly pullback toward daily BB mid — price below 1H BB mid)
+        // PM lateral guard: daily BB mid must be moving
+        const pmNotLateral = Math.abs(dayCtx.bbMidSlope) > 0.0003;
+        // C1: DIA ALCISTA — BB mid rising, price above daily BB mid, PM not lateral
+        const c1 = dayCtx.bbMidUp && dayCtx.priceAbove && pmNotLateral;
+        // C1b: 1H has some volatility
+        const cVol = bb1H.width > 1.0;
+        // C2: 1H BAJISTA (pullback hacia PM diario — precio bajo BB media 1H)
         const c2 = bar.c < bb1H.mid && bb1H.mid < bb1HPrev.mid;
-        // C3+C4: Price approached daily BB mid from above, touched it but didn't close below
-        //   low reached daily BB mid area (within 0.3%), close stayed above BB mid
+        // C3+C4: Price touched daily BB mid from above (within ±0.3%), closed above
         const distDown = (dayCtx.bbMid - bar.l) / dayCtx.bbMid;
         const c3c4     = distDown >= -0.003 && distDown <= 0.005 && bar.c > dayCtx.bbMid;
-        // C5: 15min turning bullish + 1H candle bullish (confirmation)
+        // C5: Vela confirmación 1H alcista + 15min alcista
         const c5 = bar.c > bar.o && m15Bar.c > m15Bar.o;
-        if (c1 && c2 && c3c4 && c5) tryTrade("CALL", 4, "Rebote PM ↑", 8);
+        if (c1 && cVol && c2 && c3c4 && c5) tryTrade("CALL", 4, "Rebote PM ↑", 8);
       }
 
       // ── E8: PUT — Efecto Imán Alcista ────────────────────────────────────────
-      // Uptrend + gap UP → price snaps back to MA20 (magnet effect)
+      // Global rules: ≥2d uptrend, MA20>MA40 (no entanglement, no MAs in the path)
       {
-        // C1: Clear 1H BULLISH trend ≥5 days (35 hourly bars), MA20 > MA40, no entanglement
         const tWin35  = h1Bars.slice(Math.max(0, i - 34), i + 1);
-        const c1      = checkHigherHighs(tWin35.map(b => b.h)) && ma20_1H > ma40_1H;
-        // C2: Gap UP > 1.5% at open vs previous close
+        // C1: Clear BULLISH ≥5d, MA20>MA40, MAs clearly separated (gap >0.3% = clean path)
+        const maGap   = (ma20_1H - ma40_1H) / ma40_1H;
+        const c1      = checkHigherHighs(tWin35.map(b => b.h)) && ma20_1H > ma40_1H && maGap > 0.003;
+        // C2: Gap UP > 1.5% vs previous close
         const gap     = (bar.o - prev.c) / prev.c;
         const c2      = gap > 0.015;
-        // C3: Price more than 2% above MA20 (stretched far from mean)
+        // C3: Price > 2% above MA20 (very stretched — strong magnet pull)
         const c3      = bar.c > ma20_1H * 1.02;
-        // C4: First 15min bar of this hourly period is completely ABOVE upper BB
-        //     "Completamente fuera del disipador superior" = low of candle > upper band
+        // C4: First 15min bar completely ABOVE upper BB (low > upper band)
         let firstInHourIdx = m15Idx;
         while (firstInHourIdx > 0 && m15Bars[firstInHourIdx - 1].t >= bar.t) firstInHourIdx--;
         const first15     = m15Bars[firstInHourIdx];
         const c4          = first15 && m15BB ? first15.l > m15BB.upper : false;
-        // C5: Volume surge on 1H — Worden Stochastics proxy > 80
+        // C5: Volume surge on 1H (Worden Stochastics proxy > 80 = "cruza línea roja")
         const vols1H  = h1Bars.slice(0, i + 1).map(b => b.v);
         const c5      = volStochK(vols1H, 14) > 80;
         if (c1 && c2 && c3 && c4 && c5) tryTrade("PUT", 8, "Efecto Imán ↑→PUT", 4);
       }
 
       // ── E7: CALL — Efecto Imán Bajista ───────────────────────────────────────
-      // Downtrend + gap DOWN → price snaps back to MA20 (magnet effect)
+      // Global rules: ≥2d downtrend, MA20<MA40 (no entanglement, no MAs in the path)
       {
-        // C1: Clear 1H BEARISH trend ≥5 days, MA20 < MA40, no entanglement
         const tWin35  = h1Bars.slice(Math.max(0, i - 34), i + 1);
-        const c1      = checkLowerLows(tWin35.map(b => b.l)) && ma20_1H < ma40_1H;
-        // C2: Gap DOWN > 1.5% at open vs previous close
+        // C1: Clear BEARISH ≥5d, MA20<MA40, MAs clearly separated (clean downward path)
+        const maGap   = (ma40_1H - ma20_1H) / ma40_1H;
+        const c1      = checkLowerLows(tWin35.map(b => b.l)) && ma20_1H < ma40_1H && maGap > 0.003;
+        // C2: Gap DOWN > 1.5% vs previous close
         const gap     = (bar.o - prev.c) / prev.c;
         const c2      = gap < -0.015;
-        // C3: Price more than 2% below MA20 (stretched far from mean)
+        // C3: Price > 2% below MA20 (very stretched — strong magnet pull)
         const c3      = bar.c < ma20_1H * 0.98;
-        // C4: First 15min bar of this hourly period is completely BELOW lower BB
-        //     "Completamente fuera del disipador inferior" = high of candle < lower band
+        // C4: First 15min bar completely BELOW lower BB (high < lower band)
         let firstInHourIdx = m15Idx;
         while (firstInHourIdx > 0 && m15Bars[firstInHourIdx - 1].t >= bar.t) firstInHourIdx--;
         const first15     = m15Bars[firstInHourIdx];
         const c4          = first15 && m15BB ? first15.h < m15BB.lower : false;
-        // C5: Volume surge on 1H — Worden Stochastics proxy > 80
+        // C5: Volume surge on 1H (Worden Stochastics proxy > 80)
         const vols1H  = h1Bars.slice(0, i + 1).map(b => b.v);
         const c5      = volStochK(vols1H, 14) > 80;
         if (c1 && c2 && c3 && c4 && c5) tryTrade("CALL", 7, "Efecto Imán ↓→CALL", 4);
@@ -2697,17 +2706,20 @@ function TabBacktest({ apiKey }) {
 
       {/* Methodology note */}
       <div className="bg-slate-800/60 border border-slate-700/40 rounded-xl px-3 py-2.5 space-y-0.5">
-        <div className="text-slate-300 text-xs font-semibold mb-1">8 Estrategias — datos 1H + 15min + Diario</div>
-        <div className="text-slate-500 text-xs">• E1 CALL Cambio Tend. ↑: bajista 1H → rompe MA20 al alza + 15min alcista</div>
-        <div className="text-slate-500 text-xs">• E2 PUT Cambio Tend. ↓: alcista 1H → rompe MA20 a la baja + 15min bajista</div>
-        <div className="text-slate-500 text-xs">• E3 PUT Rebote PM ↓: tendencia bajista DIA + rally 1H toca BB media DIA + 15min baja</div>
-        <div className="text-slate-500 text-xs">• E4 CALL Rebote PM ↑: tendencia alcista DIA + pullback 1H toca BB media DIA + 15min sube</div>
-        <div className="text-slate-500 text-xs">• E5 PUT Lat. Aper. ↑: BB 15min lat. &lt;1% + gap sube sobre BB sup a las 9:30 ET + vela bajista</div>
-        <div className="text-slate-500 text-xs">• E6 CALL Lat. Aper. ↓: BB 15min lat. &lt;1% + gap baja bajo BB inf a las 9:30 ET + vela alcista</div>
-        <div className="text-slate-500 text-xs">• E7 CALL Efecto Imán ↓: bajista 1H ≥5d + gap baja 1.5% + precio &gt;2% bajo MA20 + 15min bajo BB inf</div>
-        <div className="text-slate-500 text-xs">• E8 PUT Efecto Imán ↑: alcista 1H ≥5d + gap sube 1.5% + precio &gt;2% sobre MA20 + 15min sobre BB sup</div>
-        <div className="text-slate-500 text-xs">• WIN E1/E2/E5/E6/E7/E8 = ±1.5% en 4 velas 15min · WIN E3/E4 = ±1.5% en 8 velas 15min</div>
-        <div className="text-slate-500 text-xs">• Sell limit inmediato: Plan 10% ×1.10 · Plan 35% ×1.35 · Plan 100% ×2.00 · +$2 comisión</div>
+        <div className="text-slate-300 text-xs font-semibold mb-1">8 Estrategias — Metodología Kaizen · DIA→HORA→15MIN</div>
+        <div className="text-slate-400 text-xs font-medium mt-0.5 mb-1">Reglas globales</div>
+        <div className="text-slate-500 text-xs">• Mínimo 2 días de tendencia (E1–E4, E7–E8) · E5/E6 exentas (lateral apertura)</div>
+        <div className="text-slate-500 text-xs">• Orden análisis: DIA → HORA → 15min (solo BB) · PM lateral = NO rebote</div>
+        <div className="text-slate-400 text-xs font-medium mt-1 mb-0.5">Estrategias</div>
+        <div className="text-slate-500 text-xs">• E1 CALL: bajista 1H ≥2d → rompe MA20 al alza + BB 15min alcista + volatilidad &gt;2%</div>
+        <div className="text-slate-500 text-xs">• E2 PUT: alcista 1H ≥2d → rompe MA20 a la baja + BB 15min bajista + volatilidad &gt;2%</div>
+        <div className="text-slate-500 text-xs">• E3 PUT: DIA bajista + PM no lateral + 1H alcista toca PM día + confirmación 15min</div>
+        <div className="text-slate-500 text-xs">• E4 CALL: DIA alcista + PM no lateral + 1H bajista toca PM día + confirmación 15min</div>
+        <div className="text-slate-500 text-xs">• E5 PUT: BB &lt;1% lateral día anterior + gap sube &gt;BB sup a las 9:30 ET + vela bajista</div>
+        <div className="text-slate-500 text-xs">• E6 CALL: BB &lt;1% lateral día anterior + gap baja &lt;BB inf a las 9:30 ET + vela alcista</div>
+        <div className="text-slate-500 text-xs">• E7 CALL: bajista ≥2d + MA20&lt;MA40 limpio + gap baja &gt;1.5% + 15min bajo BB inf + vol surge</div>
+        <div className="text-slate-500 text-xs">• E8 PUT: alcista ≥2d + MA20&gt;MA40 limpio + gap sube &gt;1.5% + 15min sobre BB sup + vol surge</div>
+        <div className="text-slate-500 text-xs">• WIN E1/E2/E5–E8 = ±1.5% en 4×15min · WIN E3/E4 = ±1.5% en 8×15min (2h para rebote)</div>
       </div>
 
       {/* Progress */}
@@ -2789,53 +2801,55 @@ function TabBacktest({ apiKey }) {
             <div className="text-slate-400 text-xs font-bold uppercase tracking-wider">Condiciones evaluadas</div>
             {[
               { label:"E1 CALL — Cambio Tendencia ↑", color:"text-green-400", bg:"bg-green-900/20",
-                conds:["C1: Tendencia bajista 1H (mínimos más bajos, ≥60% pares)",
-                       "C2: Rompe resistencia (cierre > máximos del período)",
-                       "C3: Cruza MA20 al alza con vela alcista + prev < MA20",
-                       "C4: 15min precio > BB media y BB media apunta arriba",
-                       "C5: BB ancho 1H > 2%  |  WIN: +1.5% en 4 velas 15min"] },
+                conds:["REGLA GLOBAL: ≥2 días tendencia · DIA→HORA→15min · BB 1H >2% (volatilidad)",
+                       "C1: Tendencia BAJISTA 1H ≥2 días (mínimos más bajos, ≥60% de 13 barras)",
+                       "C2: Rompe resistencia — cierre > máximos del período de tendencia",
+                       "C3: Cruza MA20 al alza con vela alcista; barra anterior estaba bajo MA20",
+                       "C4: BB 15min — precio > media y media apunta arriba  |  WIN: +1.5% en 4×15min"] },
               { label:"E2 PUT — Cambio Tendencia ↓",  color:"text-red-400",   bg:"bg-red-900/20",
-                conds:["C1: Tendencia alcista 1H (máximos más altos, ≥60%)",
-                       "C2: Rompe soporte (cierre < mínimos del período)",
-                       "C3: Cruza MA20 a la baja con vela bajista + prev > MA20",
-                       "C4: 15min precio < BB media y BB media apunta abajo",
-                       "C5: BB ancho 1H > 2%  |  WIN: −1.5% en 4 velas 15min"] },
+                conds:["REGLA GLOBAL: ≥2 días tendencia · DIA→HORA→15min · BB 1H >2% (volatilidad)",
+                       "C1: Tendencia ALCISTA 1H ≥2 días (máximos más altos, ≥60% de 13 barras)",
+                       "C2: Rompe soporte — cierre < mínimos del período de tendencia",
+                       "C3: Cruza MA20 a la baja con vela bajista; barra anterior estaba sobre MA20",
+                       "C4: BB 15min — precio < media y media apunta abajo  |  WIN: −1.5% en 4×15min"] },
               { label:"E3 PUT — Rebote Punto Medio ↓", color:"text-red-400",  bg:"bg-red-900/20",
-                conds:["C1: DIA BAJISTA — BB media diaria apuntando abajo, precio < BB media día",
-                       "C2: 1H ALCISTA — precio > BB media 1H y BB media 1H subiendo",
-                       "C3+C4: Precio toca BB media DIA (máximo dentro ±0.3%) y cierra por debajo",
-                       "C5: Vela 1H bajista + última vela 15min bajista (confirmación)",
-                       "WIN: −1.5% en 8 velas 15min (2h para jugar el rebote)"] },
+                conds:["REGLA GLOBAL: DIA bajista ≥2d + PM NO lateral (pendiente >0.03%/día) + vol 1H >1%",
+                       "C1: DIA BAJISTA — BB media diaria apuntando abajo + precio bajo PM diario",
+                       "C2: 1H ALCISTA — rally hacia PM diario (precio > BB media 1H subiendo)",
+                       "C3+C4: Precio toca PM diario (máximo dentro ±0.3%) y cierra por debajo",
+                       "C5: Vela confirmación 1H bajista + 15min bajista  |  WIN: −1.5% en 8×15min"] },
               { label:"E4 CALL — Rebote Punto Medio ↑", color:"text-green-400", bg:"bg-green-900/20",
-                conds:["C1: DIA ALCISTA — BB media diaria apuntando arriba, precio > BB media día",
-                       "C2: 1H BAJISTA — precio < BB media 1H y BB media 1H bajando",
-                       "C3+C4: Precio toca BB media DIA (mínimo dentro ±0.3%) y cierra por encima",
-                       "C5: Vela 1H alcista + última vela 15min alcista (confirmación)",
-                       "WIN: +1.5% en 8 velas 15min (2h para jugar el rebote)"] },
+                conds:["REGLA GLOBAL: DIA alcista ≥2d + PM NO lateral (pendiente >0.03%/día) + vol 1H >1%",
+                       "C1: DIA ALCISTA — BB media diaria apuntando arriba + precio sobre PM diario",
+                       "C2: 1H BAJISTA — pullback hacia PM diario (precio < BB media 1H bajando)",
+                       "C3+C4: Precio toca PM diario (mínimo dentro ±0.3%) y cierra por encima",
+                       "C5: Vela confirmación 1H alcista + 15min alcista  |  WIN: +1.5% en 8×15min"] },
               { label:"E5 PUT — Lateral Apertura Arriba", color:"text-red-400", bg:"bg-red-900/20",
-                conds:["C1: BB 15min TOTALMENTE LATERAL sin volatilidad — ancho BB < 1%",
-                       "C2: GAP de apertura AL ALZA: precio abre sobre disipador SUPERIOR (zona sobrecompra)",
-                       "C3: Precio comienza a BAJAR — primera vela 9:30 ET es bajista (cierre < apertura)",
-                       "C4: Señal válida SOLO en los primeros 5min (vela 9:30–9:35 ET)",
-                       "WIN: −1.5% en 4 velas 15min  |  Sin señal antes de 9:35 = NO ENTRAR"] },
+                conds:["ÚNICA estrategia SIN tendencia previa — BB debe cerrar lateral el día anterior",
+                       "C1: BB 15min COMPLETAMENTE LATERAL — ancho < 1% (calculado en cierre día anterior)",
+                       "C2: GAP apertura AL ALZA — precio abre sobre disipador SUPERIOR (sobrecompra extrema)",
+                       "C3: Precio comienza a BAJAR — vela 9:30 ET es bajista (cierre < apertura)",
+                       "C4: Solo vela 9:30–9:35 ET válida  |  WIN: −1.5% en 4×15min · Sin señal = NO ENTRAR"] },
               { label:"E6 CALL — Lateral Apertura Abajo", color:"text-green-400", bg:"bg-green-900/20",
-                conds:["C1: BB 15min TOTALMENTE LATERAL sin volatilidad — ancho BB < 1%",
-                       "C2: GAP de apertura A LA BAJA: precio abre bajo disipador INFERIOR (zona sobreventa)",
-                       "C3: Precio comienza a SUBIR — primera vela 9:30 ET es alcista (cierre > apertura)",
-                       "C4: Señal válida SOLO en los primeros 5min (vela 9:30–9:35 ET)",
-                       "WIN: +1.5% en 4 velas 15min  |  Sin señal antes de 9:35 = NO ENTRAR"] },
+                conds:["ÚNICA estrategia SIN tendencia previa — BB debe cerrar lateral el día anterior",
+                       "C1: BB 15min COMPLETAMENTE LATERAL — ancho < 1% (calculado en cierre día anterior)",
+                       "C2: GAP apertura A LA BAJA — precio abre bajo disipador INFERIOR (sobreventa extrema)",
+                       "C3: Precio comienza a SUBIR — vela 9:30 ET es alcista (cierre > apertura)",
+                       "C4: Solo vela 9:30–9:35 ET válida  |  WIN: +1.5% en 4×15min · Sin señal = NO ENTRAR"] },
               { label:"E7 CALL — Efecto Imán Bajista", color:"text-green-400", bg:"bg-green-900/20",
-                conds:["C1: 1H BAJISTA ≥5 días — mínimos más bajos, MA20 < MA40 (medias NO entrelazadas)",
-                       "C2: GAP de apertura a la BAJA > 1.5% vs cierre anterior",
-                       "C3: Precio > 2% por DEBAJO de MA20 en 1H (muy alejado del imán)",
-                       "C4: Primera vela 15min completamente FUERA del disipador INFERIOR de BB",
-                       "C5: Volumen en 1H cruza línea roja (Worden Stochastics >80)  |  WIN: +1.5% en 4 velas"] },
+                conds:["REGLA GLOBAL: ≥2d bajista · MA20<MA40 con recorrido limpio (separación >0.3%)",
+                       "C1: 1H BAJISTA ≥5 días — mínimos más bajos, MA20 < MA40, NO entrelazadas ni en recorrido",
+                       "C2: GAP apertura A LA BAJA > 1.5% vs cierre anterior",
+                       "C3: Precio > 2% por debajo de MA20 (muy alejado — imán fuerte)",
+                       "C4: Primera vela 15min completamente bajo disipador INFERIOR de BB",
+                       "C5: Volumen 1H > línea roja Worden Stochastics (>80)  |  WIN: +1.5% en 4×15min"] },
               { label:"E8 PUT — Efecto Imán Alcista", color:"text-red-400", bg:"bg-red-900/20",
-                conds:["C1: 1H ALCISTA ≥5 días — máximos más altos, MA20 > MA40 (medias NO entrelazadas)",
-                       "C2: GAP de apertura al ALZA > 1.5% vs cierre anterior",
-                       "C3: Precio > 2% por ENCIMA de MA20 en 1H (muy alejado del imán)",
-                       "C4: Primera vela 15min completamente FUERA del disipador SUPERIOR de BB",
-                       "C5: Volumen en 1H cruza línea roja (Worden Stochastics >80)  |  WIN: −1.5% en 4 velas"] },
+                conds:["REGLA GLOBAL: ≥2d alcista · MA20>MA40 con recorrido limpio (separación >0.3%)",
+                       "C1: 1H ALCISTA ≥5 días — máximos más altos, MA20 > MA40, NO entrelazadas ni en recorrido",
+                       "C2: GAP apertura AL ALZA > 1.5% vs cierre anterior",
+                       "C3: Precio > 2% por encima de MA20 (muy alejado — imán fuerte)",
+                       "C4: Primera vela 15min completamente sobre disipador SUPERIOR de BB",
+                       "C5: Volumen 1H > línea roja Worden Stochastics (>80)  |  WIN: −1.5% en 4×15min"] },
             ].map(s => (
               <div key={s.label} className={`${s.bg} rounded-xl px-3 py-2`}>
                 <div className={`font-bold text-xs mb-1 ${s.color}`}>{s.label}</div>
