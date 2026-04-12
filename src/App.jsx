@@ -2180,15 +2180,16 @@ function TabBot({ market, selectedTickers, apiKey }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// BACKTEST ENGINE — Estrategia Cambio de Tendencia (1H + 15min)
+// BACKTEST ENGINE — E1/E2 Cambio de Tendencia + E3/E4 Rebote Punto Medio
 // ═══════════════════════════════════════════════════════════════════════════════
-const BT_CAPITAL = 10000;  // virtual starting capital
-const BT_POS_PCT = 0.05;   // 5 % of equity per trade
-const BT_WIN_PCT = 0.35;   // Plan 35 % profit target
-const BT_COMM    = 2;      // $2 commission per round-trip
-const BT_SYMS    = ["TSLA", "GOOGL", "MSFT", "META"];
-// WIN condition: 1.5% price move in right direction within 4 fifteen-min bars after signal
-const BT_WIN_MOVE_15M = 0.015;
+const BT_CAPITAL      = 10000;  // virtual starting capital
+const BT_POS_PCT      = 0.05;   // 5% of equity per trade
+const BT_WIN_PCT      = 0.35;   // Plan 35% profit target
+const BT_COMM         = 2;      // $2 commission per round-trip
+const BT_SYMS         = ["TSLA", "GOOGL", "MSFT", "META"];
+const BT_WIN_MOVE_15M = 0.015;  // 1.5% stock move = WIN (next 4 fifteen-min bars)
+// Sell limit rule (global): entry × plan_mult + $2 commission
+// Plan 10%: ×1.10 + $2 · Plan 35%: ×1.35 + $2 · Plan 100%: ×2.00 + $2
 
 // ─── Backtest data helpers ────────────────────────────────────────────────────
 
@@ -2217,6 +2218,16 @@ function checkHigherHighs(highs) {
   let up = 0;
   for (let i = 1; i < highs.length; i++) { if (highs[i] > highs[i-1]) up++; }
   return up >= Math.ceil((highs.length - 1) * 0.6);
+}
+
+// Volume stochastic %K over last `period` bars (approximates Worden Stochastics)
+// Returns 0–100; > 80 = volume surge ("cruza línea roja")
+function volStochK(vols, period = 14) {
+  if (vols.length < period) return 0;
+  const sl = vols.slice(-period);
+  const lo = Math.min(...sl), hi = Math.max(...sl);
+  if (hi === lo) return 50;
+  return ((sl[sl.length - 1] - lo) / (hi - lo)) * 100;
 }
 
 // 1H bars — 3 months (signal detection + MA/BB warmup)
@@ -2255,7 +2266,41 @@ async function fetch15MinBars(sym, apiKey, attempt = 0) {
   return (await res.json()).results || [];
 }
 
-// ─── Backtest — Cambio de Tendencia (1H + 15min) ──────────────────────────────
+// Daily bars — 6 months (for E3/E4 daily BB mid context)
+async function fetchDailyBars(sym, apiKey, attempt = 0) {
+  const to   = new Date();
+  const from = new Date(); from.setMonth(from.getMonth() - 6);
+  const url  = `https://api.polygon.io/v2/aggs/ticker/${sym}/range/1/day/`
+    + `${from.toISOString().split("T")[0]}/${to.toISOString().split("T")[0]}`
+    + `?adjusted=true&sort=asc&limit=200&apiKey=${apiKey}`;
+  let res;
+  try { res = await fetch(url); }
+  catch { throw new Error(`Red — ${sym}`); }
+  if (res.status === 429) {
+    if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetchDailyBars(sym, apiKey, attempt+1); }
+    throw new Error(`429 — ${sym}`);
+  }
+  if (!res.ok) throw new Error(`HTTP ${res.status} — ${sym}`);
+  return (await res.json()).results || [];
+}
+
+// Returns daily BB context at the timestamp of a given hourly bar.
+// Needs ≥20 daily bars before that point.
+function getDailyCtx(dailyBars, hourlyTs) {
+  const idx = findBarIndex(dailyBars, hourlyTs);
+  if (idx < 20) return null;
+  const closes  = dailyBars.slice(0, idx + 1).map(b => b.c);
+  const bb      = calcBB(closes, 20);
+  const bbPrev  = calcBB(closes.slice(0, -1), 20);
+  if (!bb || !bbPrev) return null;
+  return {
+    bbMid:       bb.mid,
+    bbMidUp:     bb.mid > bbPrev.mid,        // BB mid pointing up
+    priceAbove:  dailyBars[idx].c > bb.mid,  // daily close above BB mid
+  };
+}
+
+// ─── Backtest — E1/E2 Cambio de Tendencia + E3/E4 Rebote Punto Medio ──────────
 // E1 CALL: 1H downtrend (lower lows) → break up (close > recent highs) →
 //          MA20 cross up + bullish candle → 15min BB mid pointing up + price > mid
 //          → Volatilidad BB_1H > 2 %
@@ -2265,26 +2310,26 @@ async function fetch15MinBars(sym, apiKey, attempt = 0) {
 //          MA20 cross down + bearish candle → 15min BB mid pointing down + price < mid
 //          → Volatilidad BB_1H > 2 %
 //          WIN = −1.5 % move in next 4 fifteen-min bars
-function runBacktest(h1Data, m15Data) {
+function runBacktest(h1Data, m15Data, dailyData) {
   const rawTrades = [];
 
   for (const sym of BT_SYMS) {
-    const h1Bars  = h1Data[sym]  || [];
-    const m15Bars = m15Data[sym] || [];
-    if (h1Bars.length < 25 || m15Bars.length < 25) continue;
+    const h1Bars   = h1Data[sym]    || [];
+    const m15Bars  = m15Data[sym]   || [];
+    const dayBars  = dailyData[sym] || [];
+    if (h1Bars.length < 45 || m15Bars.length < 25) continue;
 
-    for (let i = 22; i < h1Bars.length - 2; i++) {
+    for (let i = 42; i < h1Bars.length - 2; i++) {
       const bar  = h1Bars[i];
       const prev = h1Bars[i - 1];
 
       // ── 1H context ───────────────────────────────────────────────────────────
       const closes1H = h1Bars.slice(0, i + 1).map(b => b.c);
       const ma20_1H  = sma(closes1H, 20);
+      const ma40_1H  = sma(closes1H, 40);
       const bb1H     = calcBB(closes1H, 20);
-      if (!ma20_1H || !bb1H) continue;
-
-      // Cond 5: BB width > 2% on 1H (high or extreme volatility)
-      if (bb1H.width <= 2) continue;
+      const bb1HPrev = calcBB(closes1H.slice(0, -1), 20);
+      if (!ma20_1H || !ma40_1H || !bb1H || !bb1HPrev) continue;
 
       // Trend window: last 7 hourly bars BEFORE current bar
       const tWin  = h1Bars.slice(Math.max(0, i - 6), i);
@@ -2296,70 +2341,128 @@ function runBacktest(h1Data, m15Data) {
       const m15Idx = findBarIndex(m15Bars, bar.t);
       if (m15Idx < 22) continue;
 
-      const m15Cl    = m15Bars.slice(0, m15Idx + 1).map(b => b.c);
-      const m15BB    = calcBB(m15Cl, 20);
-      const m15BBpr  = calcBB(m15Cl.slice(0, -1), 20);
-      const m15Bar   = m15Bars[m15Idx];
+      const m15Cl   = m15Bars.slice(0, m15Idx + 1).map(b => b.c);
+      const m15BB   = calcBB(m15Cl, 20);
+      const m15BBpr = calcBB(m15Cl.slice(0, -1), 20);
+      const m15Bar  = m15Bars[m15Idx];
       if (!m15BB || !m15BBpr) continue;
+
+      // ── Daily context (for E3/E4) ─────────────────────────────────────────────
+      const dayCtx = dayBars.length >= 21 ? getDailyCtx(dayBars, bar.t) : null;
 
       const dateStr = new Date(bar.t).toISOString().split("T")[0];
 
-      // ── E1: CALL — Cambio de Tendencia al Alza ───────────────────────────────
-      {
-        // Cond 1: 1H downtrend — lower lows in last 5-7 bars
-        const c1 = checkLowerLows(lows7);
-        // Cond 2: break of downtrend — close > highest high in trend window
-        const resistance = Math.max(...tWin.map(b => b.h));
-        const c2 = bar.c > resistance;
-        // Cond 3: crosses above MA20 on 1H, bullish candle, prev was below MA20
-        const c3 = bar.c > ma20_1H && bar.c > bar.o && prev.c < ma20_1H;
-        // Cond 4: 15min price > BB mid, BB mid pointing up
-        const c4 = m15Bar.c > m15BB.mid && m15BB.mid > m15BBpr.mid;
-
-        if (c1 && c2 && c3 && c4) {
-          const nextM15 = m15Idx + 1;
-          if (nextM15 >= m15Bars.length) continue;
-          const entry  = m15Bars[nextM15].o;
-          const target = entry * (1 + BT_WIN_MOVE_15M);
-          let outcome  = "LOSS";
-          for (let j = nextM15; j <= nextM15 + 3 && j < m15Bars.length; j++) {
-            if (m15Bars[j].h >= target) { outcome = "WIN"; break; }
+      // ── Helper: enter + check WIN in next N fifteen-min bars ─────────────────
+      const tryTrade = (dir, stratId, stratName, nBars = 4) => {
+        const nextM15 = m15Idx + 1;
+        if (nextM15 >= m15Bars.length) return;
+        const entry  = m15Bars[nextM15].o;
+        const target = dir === "CALL" ? entry * (1 + BT_WIN_MOVE_15M)
+                                      : entry * (1 - BT_WIN_MOVE_15M);
+        let outcome  = "LOSS";
+        for (let j = nextM15; j <= nextM15 + nBars - 1 && j < m15Bars.length; j++) {
+          if (dir === "CALL" ? m15Bars[j].h >= target : m15Bars[j].l <= target) {
+            outcome = "WIN"; break;
           }
-          rawTrades.push({
-            id: `${sym}_call_${bar.t}`, date: dateStr, sym,
-            dir: "CALL", stratId: 1, stratName: "Cambio Tendencia ↑",
-            entry, outcome,
-          });
         }
+        rawTrades.push({ id:`${sym}_${dir.toLowerCase()}_${bar.t}`,
+          date:dateStr, sym, dir, stratId, stratName, entry, outcome });
+      };
+
+      // ── E1: CALL — Cambio de Tendencia al Alza ───────────────────────────────
+      // C5 global: BB width 1H > 2%
+      if (bb1H.width > 2) {
+        const c1 = checkLowerLows(lows7);                               // 1H downtrend
+        const c2 = bar.c > Math.max(...tWin.map(b => b.h));            // breaks resistance
+        const c3 = bar.c > ma20_1H && bar.c > bar.o && prev.c < ma20_1H; // MA20 cross up
+        const c4 = m15Bar.c > m15BB.mid && m15BB.mid > m15BBpr.mid;    // 15min bullish
+        if (c1 && c2 && c3 && c4) tryTrade("CALL", 1, "Cambio Tend. ↑");
       }
 
       // ── E2: PUT — Cambio de Tendencia a la Baja ──────────────────────────────
-      {
-        // Cond 1: 1H uptrend — higher highs in last 5-7 bars
-        const c1 = checkHigherHighs(highs7);
-        // Cond 2: break of uptrend — close < lowest low in trend window
-        const support = Math.min(...tWin.map(b => b.l));
-        const c2 = bar.c < support;
-        // Cond 3: crosses below MA20 on 1H, bearish candle, prev was above MA20
-        const c3 = bar.c < ma20_1H && bar.c < bar.o && prev.c > ma20_1H;
-        // Cond 4: 15min price < BB mid, BB mid pointing down
-        const c4 = m15Bar.c < m15BB.mid && m15BB.mid < m15BBpr.mid;
+      if (bb1H.width > 2) {
+        const c1 = checkHigherHighs(highs7);                            // 1H uptrend
+        const c2 = bar.c < Math.min(...tWin.map(b => b.l));            // breaks support
+        const c3 = bar.c < ma20_1H && bar.c < bar.o && prev.c > ma20_1H; // MA20 cross down
+        const c4 = m15Bar.c < m15BB.mid && m15BB.mid < m15BBpr.mid;    // 15min bearish
+        if (c1 && c2 && c3 && c4) tryTrade("PUT", 2, "Cambio Tend. ↓");
+      }
 
-        if (c1 && c2 && c3 && c4) {
-          const nextM15 = m15Idx + 1;
-          if (nextM15 >= m15Bars.length) continue;
-          const entry  = m15Bars[nextM15].o;
-          const target = entry * (1 - BT_WIN_MOVE_15M);
-          let outcome  = "LOSS";
-          for (let j = nextM15; j <= nextM15 + 3 && j < m15Bars.length; j++) {
-            if (m15Bars[j].l <= target) { outcome = "WIN"; break; }
-          }
-          rawTrades.push({
-            id: `${sym}_put_${bar.t}`, date: dateStr, sym,
-            dir: "PUT", stratId: 2, stratName: "Cambio Tendencia ↓",
-            entry, outcome,
-          });
-        }
+      // ── E3: PUT — Rebote Punto Medio a la Baja ───────────────────────────────
+      // Requires daily bars for BB mid context
+      if (dayCtx) {
+        // C1: Daily BEARISH trend (BB mid pointing down, price below daily BB mid)
+        const c1 = !dayCtx.bbMidUp && !dayCtx.priceAbove;
+        // C2: 1H BULLISH (hourly rally toward daily BB mid — price above 1H BB mid)
+        const c2 = bar.c > bb1H.mid && bb1H.mid > bb1HPrev.mid;
+        // C3+C4: Price approached daily BB mid from below, touched it but didn't close above
+        //   high reached daily BB mid (within 0.3%), close stayed below BB mid
+        const distUp  = (bar.h - dayCtx.bbMid) / dayCtx.bbMid;
+        const c3c4    = distUp >= -0.003 && distUp <= 0.005 && bar.c < dayCtx.bbMid;
+        // C5: 15min turning bearish + 1H candle bearish (confirmation)
+        const c5 = bar.c < bar.o && m15Bar.c < m15Bar.o;
+        if (c1 && c2 && c3c4 && c5) tryTrade("PUT", 3, "Rebote PM ↓", 8);
+      }
+
+      // ── E4: CALL — Rebote Punto Medio al Alza ────────────────────────────────
+      if (dayCtx) {
+        // C1: Daily BULLISH trend (BB mid pointing up, price above daily BB mid)
+        const c1 = dayCtx.bbMidUp && dayCtx.priceAbove;
+        // C2: 1H BEARISH (hourly pullback toward daily BB mid — price below 1H BB mid)
+        const c2 = bar.c < bb1H.mid && bb1H.mid < bb1HPrev.mid;
+        // C3+C4: Price approached daily BB mid from above, touched it but didn't close below
+        //   low reached daily BB mid area (within 0.3%), close stayed above BB mid
+        const distDown = (dayCtx.bbMid - bar.l) / dayCtx.bbMid;
+        const c3c4     = distDown >= -0.003 && distDown <= 0.005 && bar.c > dayCtx.bbMid;
+        // C5: 15min turning bullish + 1H candle bullish (confirmation)
+        const c5 = bar.c > bar.o && m15Bar.c > m15Bar.o;
+        if (c1 && c2 && c3c4 && c5) tryTrade("CALL", 4, "Rebote PM ↑", 8);
+      }
+
+      // ── E8: PUT — Efecto Imán Alcista ────────────────────────────────────────
+      // Uptrend + gap UP → price snaps back to MA20 (magnet effect)
+      {
+        // C1: Clear 1H BULLISH trend ≥5 days (35 hourly bars), MA20 > MA40, no entanglement
+        const tWin35  = h1Bars.slice(Math.max(0, i - 34), i + 1);
+        const c1      = checkHigherHighs(tWin35.map(b => b.h)) && ma20_1H > ma40_1H;
+        // C2: Gap UP > 1.5% at open vs previous close
+        const gap     = (bar.o - prev.c) / prev.c;
+        const c2      = gap > 0.015;
+        // C3: Price more than 2% above MA20 (stretched far from mean)
+        const c3      = bar.c > ma20_1H * 1.02;
+        // C4: First 15min bar of this hourly period is completely ABOVE upper BB
+        //     "Completamente fuera del disipador superior" = low of candle > upper band
+        let firstInHourIdx = m15Idx;
+        while (firstInHourIdx > 0 && m15Bars[firstInHourIdx - 1].t >= bar.t) firstInHourIdx--;
+        const first15     = m15Bars[firstInHourIdx];
+        const c4          = first15 && m15BB ? first15.l > m15BB.upper : false;
+        // C5: Volume surge on 1H — Worden Stochastics proxy > 80
+        const vols1H  = h1Bars.slice(0, i + 1).map(b => b.v);
+        const c5      = volStochK(vols1H, 14) > 80;
+        if (c1 && c2 && c3 && c4 && c5) tryTrade("PUT", 8, "Efecto Imán ↑→PUT", 4);
+      }
+
+      // ── E7: CALL — Efecto Imán Bajista ───────────────────────────────────────
+      // Downtrend + gap DOWN → price snaps back to MA20 (magnet effect)
+      {
+        // C1: Clear 1H BEARISH trend ≥5 days, MA20 < MA40, no entanglement
+        const tWin35  = h1Bars.slice(Math.max(0, i - 34), i + 1);
+        const c1      = checkLowerLows(tWin35.map(b => b.l)) && ma20_1H < ma40_1H;
+        // C2: Gap DOWN > 1.5% at open vs previous close
+        const gap     = (bar.o - prev.c) / prev.c;
+        const c2      = gap < -0.015;
+        // C3: Price more than 2% below MA20 (stretched far from mean)
+        const c3      = bar.c < ma20_1H * 0.98;
+        // C4: First 15min bar of this hourly period is completely BELOW lower BB
+        //     "Completamente fuera del disipador inferior" = high of candle < lower band
+        let firstInHourIdx = m15Idx;
+        while (firstInHourIdx > 0 && m15Bars[firstInHourIdx - 1].t >= bar.t) firstInHourIdx--;
+        const first15     = m15Bars[firstInHourIdx];
+        const c4          = first15 && m15BB ? first15.h < m15BB.lower : false;
+        // C5: Volume surge on 1H — Worden Stochastics proxy > 80
+        const vols1H  = h1Bars.slice(0, i + 1).map(b => b.v);
+        const c5      = volStochK(vols1H, 14) > 80;
+        if (c1 && c2 && c3 && c4 && c5) tryTrade("CALL", 7, "Efecto Imán ↓→CALL", 4);
       }
     }
   }
@@ -2376,6 +2479,23 @@ function runBacktest(h1Data, m15Data) {
     curve.push({ date: t.date, equity });
   }
 
+  // Per-strategy summaries
+  const stratDefs = [
+    { id:1, name:"Cambio Tend. ↑",    dir:"CALL" },
+    { id:2, name:"Cambio Tend. ↓",    dir:"PUT"  },
+    { id:3, name:"Rebote PM ↓",       dir:"PUT"  },
+    { id:4, name:"Rebote PM ↑",       dir:"CALL" },
+    { id:7, name:"Efecto Imán ↓CALL", dir:"CALL" },
+    { id:8, name:"Efecto Imán ↑PUT",  dir:"PUT"  },
+  ];
+  const stratSums = stratDefs.map(s => {
+    const st   = rawTrades.filter(t => t.stratId === s.id);
+    const wins = st.filter(t => t.outcome === "WIN").length;
+    const pnl  = st.reduce((acc, t) => acc + (t.pnl ?? 0), 0);
+    return { ...s, fires:st.length, wins,
+      winRate: st.length ? wins / st.length * 100 : 0, pnl };
+  });
+
   const callTrades = rawTrades.filter(t => t.dir === "CALL");
   const putTrades  = rawTrades.filter(t => t.dir === "PUT");
   const callWins   = callTrades.filter(t => t.outcome === "WIN").length;
@@ -2385,7 +2505,7 @@ function runBacktest(h1Data, m15Data) {
   const totalWins  = rawTrades.filter(t => t.outcome === "WIN").length;
 
   return {
-    trades: rawTrades, curve, equity,
+    trades: rawTrades, curve, equity, stratSums,
     totalTrades: rawTrades.length, totalWins,
     winRate:     rawTrades.length   ? totalWins / rawTrades.length   * 100 : 0,
     totalPnl:    equity - BT_CAPITAL,
@@ -2469,19 +2589,23 @@ function TabBacktest({ apiKey }) {
   const run = async () => {
     if (!apiKey) { setError("Necesitas configurar la API key de Polygon primero"); return; }
     setRunning(true); setError(null); setResults(null);
-    const h1Data  = {};
-    const m15Data = {};
-    // 4 symbols × 2 timeframes = 8 calls; 15s between each
+    const h1Data   = {};
+    const m15Data  = {};
+    const dayData  = {};
+    // 4 symbols × 3 timeframes = 12 calls; 15s between each (~3 min total)
     const allFetches = [
       ...BT_SYMS.map(sym => ({ sym, type: "1h"  })),
       ...BT_SYMS.map(sym => ({ sym, type: "15m" })),
+      ...BT_SYMS.map(sym => ({ sym, type: "day" })),
     ];
     try {
       for (let i = 0; i < allFetches.length; i++) {
         const { sym, type } = allFetches[i];
-        setProgress(`${type === "1h" ? "1 Hora" : "15 Minutos"} ${sym} (${i+1}/${allFetches.length})…`);
+        const lbl = type === "1h" ? "1H" : type === "15m" ? "15min" : "Diario";
+        setProgress(`${lbl} ${sym} (${i+1}/${allFetches.length})…`);
         if (type === "1h")  h1Data[sym]  = await fetch1HBars(sym, apiKey);
-        else                m15Data[sym] = await fetch15MinBars(sym, apiKey);
+        else if (type === "15m") m15Data[sym] = await fetch15MinBars(sym, apiKey);
+        else                dayData[sym] = await fetchDailyBars(sym, apiKey);
         if (i < allFetches.length - 1) {
           for (let s = 15; s >= 1; s--) {
             setProgress(`Esperando ${s}s — límite API… (${i+1}/${allFetches.length})`);
@@ -2489,9 +2613,9 @@ function TabBacktest({ apiKey }) {
           }
         }
       }
-      setProgress("Detectando señales de cambio de tendencia…");
+      setProgress("Detectando señales (E1–E4, E7–E8)…");
       await new Promise(r => setTimeout(r, 50));
-      setResults(runBacktest(h1Data, m15Data));
+      setResults(runBacktest(h1Data, m15Data, dayData));
     } catch(e) { setError(e.message); }
     setProgress(""); setRunning(false);
   };
@@ -2519,11 +2643,15 @@ function TabBacktest({ apiKey }) {
 
       {/* Methodology note */}
       <div className="bg-slate-800/60 border border-slate-700/40 rounded-xl px-3 py-2.5 space-y-0.5">
-        <div className="text-slate-300 text-xs font-semibold mb-1">Estrategia: Cambio de Tendencia (datos 1H + 15min)</div>
-        <div className="text-slate-500 text-xs">• E1 CALL: tendencia bajista 1H → ruptura MA20 al alza + 15min alcista</div>
-        <div className="text-slate-500 text-xs">• E2 PUT: tendencia alcista 1H → ruptura MA20 a la baja + 15min bajista</div>
-        <div className="text-slate-500 text-xs">• WIN = +1.5% en dirección correcta en las siguientes 4 velas de 15min</div>
-        <div className="text-slate-500 text-xs">• TSLA · GOOGL · MSFT · META · Capital $10,000 · 5% por trade · Plan 35%</div>
+        <div className="text-slate-300 text-xs font-semibold mb-1">6 Estrategias — datos 1H + 15min + Diario</div>
+        <div className="text-slate-500 text-xs">• E1 CALL Cambio Tend. ↑: bajista 1H → rompe MA20 al alza + 15min alcista</div>
+        <div className="text-slate-500 text-xs">• E2 PUT Cambio Tend. ↓: alcista 1H → rompe MA20 a la baja + 15min bajista</div>
+        <div className="text-slate-500 text-xs">• E3 PUT Rebote PM ↓: tendencia bajista DIA + rally 1H toca BB media DIA + 15min baja</div>
+        <div className="text-slate-500 text-xs">• E4 CALL Rebote PM ↑: tendencia alcista DIA + pullback 1H toca BB media DIA + 15min sube</div>
+        <div className="text-slate-500 text-xs">• E7 CALL Efecto Imán ↓: bajista 1H ≥5d + gap baja 1.5% + precio &gt;2% bajo MA20 + 15min bajo BB inf</div>
+        <div className="text-slate-500 text-xs">• E8 PUT Efecto Imán ↑: alcista 1H ≥5d + gap sube 1.5% + precio &gt;2% sobre MA20 + 15min sobre BB sup</div>
+        <div className="text-slate-500 text-xs">• WIN E1/E2/E7/E8 = ±1.5% en 4 velas 15min · WIN E3/E4 = ±1.5% en 8 velas 15min</div>
+        <div className="text-slate-500 text-xs">• Sell limit inmediato: Plan 10% ×1.10 · Plan 35% ×1.35 · Plan 100% ×2.00 · +$2 comisión</div>
       </div>
 
       {/* Progress */}
@@ -2559,33 +2687,44 @@ function TabBacktest({ apiKey }) {
             ))}
           </div>
 
-          {/* E1 CALL vs E2 PUT breakdown */}
+          {/* Per-strategy breakdown */}
           <div className="bg-slate-800 rounded-2xl p-3 border border-slate-700/60">
             <div className="text-slate-400 text-xs font-bold mb-2 uppercase tracking-wider">Resultado por Estrategia</div>
-            <div className="grid grid-cols-3 gap-2 text-xs">
-              {[
-                { label:"E1 CALL ↑", trades:results.callTrades, wins:results.callWins,
-                  wr:results.callWinRate, pnl:results.callPnl, border:"border-green-900/40",
-                  desc:"Cambio tend. alza" },
-                { label:"E2 PUT ↓",  trades:results.putTrades,  wins:results.putWins,
-                  wr:results.putWinRate,  pnl:results.putPnl,  border:"border-red-900/40",
-                  desc:"Cambio tend. baja" },
-                { label:"Total",      trades:results.totalTrades, wins:results.totalWins,
-                  wr:results.winRate,     pnl:results.totalPnl,   border:"border-slate-600/40",
-                  desc:"Combinado" },
-              ].map(row => (
-                <div key={row.label} className={`bg-slate-700/40 rounded-xl px-2.5 py-2.5 border ${row.border}`}>
-                  <div className="text-slate-200 font-bold text-xs">{row.label}</div>
-                  <div className="text-slate-500 text-xs mb-1">{row.desc}</div>
-                  <div className="text-slate-400">{row.trades} señales</div>
-                  <div className={`font-black text-base mt-0.5 ${row.wr>=50?"text-green-400":row.wr>0?"text-yellow-400":"text-slate-600"}`}>
-                    {row.trades ? row.wr.toFixed(0)+"%" : "—"}
+            <div className="grid grid-cols-2 gap-2">
+              {results.stratSums.map(s => (
+                <div key={s.id} className={`rounded-xl px-3 py-2.5 border
+                  ${s.dir==="CALL"?"bg-green-900/15 border-green-900/40":"bg-red-900/15 border-red-900/40"}`}>
+                  <div className="flex justify-between items-start mb-1">
+                    <div>
+                      <span className={`font-black text-xs ${s.dir==="CALL"?"text-green-400":"text-red-400"}`}>
+                        E{s.id} {s.dir}
+                      </span>
+                      <div className="text-slate-500 text-xs">{s.name}</div>
+                    </div>
+                    <div className={`font-black text-xl ${s.winRate>=50?"text-green-400":s.winRate>0?"text-yellow-400":"text-slate-600"}`}>
+                      {s.fires ? s.winRate.toFixed(0)+"%" : "—"}
+                    </div>
                   </div>
-                  <div className={`text-xs mt-0.5 font-bold ${row.pnl>=0?"text-green-400":"text-red-400"}`}>
-                    {row.pnl>=0?"+":""}${Math.round(row.pnl)}
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-500">{s.fires} señales · {s.wins}W {s.fires-s.wins}L</span>
+                    <span className={`font-bold ${s.pnl>=0?"text-green-400":"text-red-400"}`}>
+                      {s.pnl>=0?"+":""}${Math.round(s.pnl)}
+                    </span>
                   </div>
                 </div>
               ))}
+            </div>
+            {/* Total row */}
+            <div className="mt-2 bg-slate-700/40 rounded-xl px-3 py-2 flex justify-between items-center">
+              <span className="text-slate-300 text-xs font-bold">Total ({results.totalTrades} señales)</span>
+              <div className="flex gap-3 text-xs">
+                <span className={`font-black text-base ${results.winRate>=50?"text-green-400":results.winRate>0?"text-yellow-400":"text-red-400"}`}>
+                  {results.winRate.toFixed(1)}%
+                </span>
+                <span className={`font-bold ${results.totalPnl>=0?"text-green-400":"text-red-400"}`}>
+                  {results.totalPnl>=0?"+":""}${Math.round(results.totalPnl)}
+                </span>
+              </div>
             </div>
           </div>
 
@@ -2593,23 +2732,47 @@ function TabBacktest({ apiKey }) {
           <div className="bg-slate-800 rounded-2xl p-3 border border-slate-700/60 space-y-2">
             <div className="text-slate-400 text-xs font-bold uppercase tracking-wider">Condiciones evaluadas</div>
             {[
-              { dir:"CALL", color:"text-green-400", bg:"bg-green-900/20",
-                conds:["C1: Tendencia bajista 1H (mínimos más bajos)",
-                       "C2: Rompe resistencia (cierre > máximos recientes)",
-                       "C3: Cruza MA20 al alza con vela alcista",
-                       "C4: 15min — precio > BB media y BB media apunta arriba",
-                       "C5: BB ancho 1H > 2% (volatilidad alta)"] },
-              { dir:"PUT",  color:"text-red-400",   bg:"bg-red-900/20",
-                conds:["C1: Tendencia alcista 1H (máximos más altos)",
-                       "C2: Rompe soporte (cierre < mínimos recientes)",
-                       "C3: Cruza MA20 a la baja con vela bajista",
-                       "C4: 15min — precio < BB media y BB media apunta abajo",
-                       "C5: BB ancho 1H > 2% (volatilidad alta)"] },
+              { label:"E1 CALL — Cambio Tendencia ↑", color:"text-green-400", bg:"bg-green-900/20",
+                conds:["C1: Tendencia bajista 1H (mínimos más bajos, ≥60% pares)",
+                       "C2: Rompe resistencia (cierre > máximos del período)",
+                       "C3: Cruza MA20 al alza con vela alcista + prev < MA20",
+                       "C4: 15min precio > BB media y BB media apunta arriba",
+                       "C5: BB ancho 1H > 2%  |  WIN: +1.5% en 4 velas 15min"] },
+              { label:"E2 PUT — Cambio Tendencia ↓",  color:"text-red-400",   bg:"bg-red-900/20",
+                conds:["C1: Tendencia alcista 1H (máximos más altos, ≥60%)",
+                       "C2: Rompe soporte (cierre < mínimos del período)",
+                       "C3: Cruza MA20 a la baja con vela bajista + prev > MA20",
+                       "C4: 15min precio < BB media y BB media apunta abajo",
+                       "C5: BB ancho 1H > 2%  |  WIN: −1.5% en 4 velas 15min"] },
+              { label:"E3 PUT — Rebote Punto Medio ↓", color:"text-red-400",  bg:"bg-red-900/20",
+                conds:["C1: DIA BAJISTA — BB media diaria apuntando abajo, precio < BB media día",
+                       "C2: 1H ALCISTA — precio > BB media 1H y BB media 1H subiendo",
+                       "C3+C4: Precio toca BB media DIA (máximo dentro ±0.3%) y cierra por debajo",
+                       "C5: Vela 1H bajista + última vela 15min bajista (confirmación)",
+                       "WIN: −1.5% en 8 velas 15min (2h para jugar el rebote)"] },
+              { label:"E4 CALL — Rebote Punto Medio ↑", color:"text-green-400", bg:"bg-green-900/20",
+                conds:["C1: DIA ALCISTA — BB media diaria apuntando arriba, precio > BB media día",
+                       "C2: 1H BAJISTA — precio < BB media 1H y BB media 1H bajando",
+                       "C3+C4: Precio toca BB media DIA (mínimo dentro ±0.3%) y cierra por encima",
+                       "C5: Vela 1H alcista + última vela 15min alcista (confirmación)",
+                       "WIN: +1.5% en 8 velas 15min (2h para jugar el rebote)"] },
+              { label:"E7 CALL — Efecto Imán Bajista", color:"text-green-400", bg:"bg-green-900/20",
+                conds:["C1: 1H BAJISTA ≥5 días — mínimos más bajos, MA20 < MA40 (medias NO entrelazadas)",
+                       "C2: GAP de apertura a la BAJA > 1.5% vs cierre anterior",
+                       "C3: Precio > 2% por DEBAJO de MA20 en 1H (muy alejado del imán)",
+                       "C4: Primera vela 15min completamente FUERA del disipador INFERIOR de BB",
+                       "C5: Volumen en 1H cruza línea roja (Worden Stochastics >80)  |  WIN: +1.5% en 4 velas"] },
+              { label:"E8 PUT — Efecto Imán Alcista", color:"text-red-400", bg:"bg-red-900/20",
+                conds:["C1: 1H ALCISTA ≥5 días — máximos más altos, MA20 > MA40 (medias NO entrelazadas)",
+                       "C2: GAP de apertura al ALZA > 1.5% vs cierre anterior",
+                       "C3: Precio > 2% por ENCIMA de MA20 en 1H (muy alejado del imán)",
+                       "C4: Primera vela 15min completamente FUERA del disipador SUPERIOR de BB",
+                       "C5: Volumen en 1H cruza línea roja (Worden Stochastics >80)  |  WIN: −1.5% en 4 velas"] },
             ].map(s => (
-              <div key={s.dir} className={`${s.bg} rounded-xl px-3 py-2`}>
-                <div className={`font-bold text-xs mb-1 ${s.color}`}>{s.dir}</div>
+              <div key={s.label} className={`${s.bg} rounded-xl px-3 py-2`}>
+                <div className={`font-bold text-xs mb-1 ${s.color}`}>{s.label}</div>
                 {s.conds.map((c,i) => (
-                  <div key={i} className="text-slate-400 text-xs">{c}</div>
+                  <div key={i} className="text-slate-400 text-xs leading-relaxed">{c}</div>
                 ))}
               </div>
             ))}
@@ -2644,6 +2807,10 @@ function TabBacktest({ apiKey }) {
                     <option value="all">Todas las estrategias</option>
                     <option value="1">E1 — Cambio Tendencia ↑ CALL</option>
                     <option value="2">E2 — Cambio Tendencia ↓ PUT</option>
+                    <option value="3">E3 — Rebote Punto Medio ↓ PUT</option>
+                    <option value="4">E4 — Rebote Punto Medio ↑ CALL</option>
+                    <option value="7">E7 — Efecto Imán ↓ CALL</option>
+                    <option value="8">E8 — Efecto Imán ↑ PUT</option>
                   </select>
                   <select value={filterOutcome} onChange={e => setFilterOutcome(e.target.value)}
                     className="bg-slate-700 text-slate-300 text-xs rounded-lg px-2 py-1.5 border-0 focus:outline-none">
