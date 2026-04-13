@@ -2237,59 +2237,49 @@ function isMarketOpen15(tsMs) {
   return d.getHours() === 9 && d.getMinutes() === 30;
 }
 
-// 1H bars — 3 months (signal detection + MA/BB warmup)
-async function fetch1HBars(sym, apiKey, attempt = 0) {
-  const to   = new Date();
-  const from = new Date(); from.setMonth(from.getMonth() - 4);
-  const url  = `https://api.polygon.io/v2/aggs/ticker/${sym}/range/1/hour/`
-    + `${from.toISOString().split("T")[0]}/${to.toISOString().split("T")[0]}`
-    + `?adjusted=true&sort=asc&limit=2000&apiKey=${apiKey}`;
-  let res;
-  try { res = await fetch(url); }
-  catch { throw new Error(`Red — ${sym}`); }
-  if (res.status === 429) {
-    if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetch1HBars(sym, apiKey, attempt+1); }
-    throw new Error(`429 — ${sym}`);
-  }
-  if (!res.ok) throw new Error(`HTTP ${res.status} — ${sym}`);
-  return (await res.json()).results || [];
+// ─── Yahoo Finance data fetching (free, no API key required) ─────────────────
+// Converts YF chart response → [{t, o, h, l, c, v}] compatible with backtest engine
+
+function parseYFChart(data) {
+  const result = data?.chart?.result?.[0];
+  if (!result) return [];
+  const ts = result.timestamp || [];
+  const q  = result.indicators?.quote?.[0] || {};
+  return ts.map((t, i) => ({
+    t: t * 1000,                  // seconds → milliseconds
+    o: q.open?.[i],
+    h: q.high?.[i],
+    l: q.low?.[i],
+    c: q.close?.[i],
+    v: q.volume?.[i] ?? 0,
+  })).filter(b => b.o != null && b.h != null && b.l != null && b.c != null);
 }
 
-// 15-minute bars — 3 months (condition 4 + WIN detection)
-async function fetch15MinBars(sym, apiKey, attempt = 0) {
-  const to   = new Date();
-  const from = new Date(); from.setMonth(from.getMonth() - 3);
-  const url  = `https://api.polygon.io/v2/aggs/ticker/${sym}/range/15/minute/`
-    + `${from.toISOString().split("T")[0]}/${to.toISOString().split("T")[0]}`
-    + `?adjusted=true&sort=asc&limit=5000&apiKey=${apiKey}`;
+async function fetchYFBars(sym, interval, range, attempt = 0) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}`
+    + `?interval=${interval}&range=${range}&includePrePost=false`;
   let res;
   try { res = await fetch(url); }
-  catch { throw new Error(`Red — ${sym}`); }
-  if (res.status === 429) {
-    if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetch15MinBars(sym, apiKey, attempt+1); }
-    throw new Error(`429 — ${sym}`);
+  catch { throw new Error(`Red — ${sym} ${interval}`); }
+  if (res.status === 429 || res.status === 503) {
+    if (attempt < 3) {
+      await new Promise(r => setTimeout(r, [3000, 7000, 15000][attempt]));
+      return fetchYFBars(sym, interval, range, attempt + 1);
+    }
+    throw new Error(`Yahoo Finance rate limit — ${sym} ${interval}`);
   }
-  if (!res.ok) throw new Error(`HTTP ${res.status} — ${sym}`);
-  return (await res.json()).results || [];
+  if (!res.ok) throw new Error(`HTTP ${res.status} — ${sym} ${interval}`);
+  return parseYFChart(await res.json());
 }
+
+// 1H bars — 3 months of regular-hours hourly data
+async function fetch1HBars(sym) { return fetchYFBars(sym, "1h",  "3mo"); }
+
+// 15-minute bars — 60 days (Yahoo Finance max for intraday)
+async function fetch15MinBars(sym) { return fetchYFBars(sym, "15m", "60d"); }
 
 // Daily bars — 6 months (for E3/E4 daily BB mid context)
-async function fetchDailyBars(sym, apiKey, attempt = 0) {
-  const to   = new Date();
-  const from = new Date(); from.setMonth(from.getMonth() - 6);
-  const url  = `https://api.polygon.io/v2/aggs/ticker/${sym}/range/1/day/`
-    + `${from.toISOString().split("T")[0]}/${to.toISOString().split("T")[0]}`
-    + `?adjusted=true&sort=asc&limit=200&apiKey=${apiKey}`;
-  let res;
-  try { res = await fetch(url); }
-  catch { throw new Error(`Red — ${sym}`); }
-  if (res.status === 429) {
-    if (attempt < 3) { await new Promise(r => setTimeout(r, [15000,30000,60000][attempt])); return fetchDailyBars(sym, apiKey, attempt+1); }
-    throw new Error(`429 — ${sym}`);
-  }
-  if (!res.ok) throw new Error(`HTTP ${res.status} — ${sym}`);
-  return (await res.json()).results || [];
-}
+async function fetchDailyBars(sym) { return fetchYFBars(sym, "1d",  "6mo"); }
 
 // Returns daily BB context at the timestamp of a given hourly bar.
 // Needs ≥20 daily bars before that point.
@@ -2674,12 +2664,11 @@ function TabBacktest({ apiKey }) {
   const [showTrades,    setShowTrades]    = useState(false);
 
   const run = async () => {
-    if (!apiKey) { setError("Necesitas configurar la API key de Polygon primero"); return; }
     setRunning(true); setError(null); setResults(null);
-    const h1Data   = {};
-    const m15Data  = {};
-    const dayData  = {};
-    // 4 symbols × 3 timeframes = 12 calls; 15s between each (~3 min total)
+    const h1Data  = {};
+    const m15Data = {};
+    const dayData = {};
+    // 4 symbols × 3 timeframes = 12 calls via Yahoo Finance (free, no API key)
     const allFetches = [
       ...BT_SYMS.map(sym => ({ sym, type: "1h"  })),
       ...BT_SYMS.map(sym => ({ sym, type: "15m" })),
@@ -2689,18 +2678,18 @@ function TabBacktest({ apiKey }) {
       for (let i = 0; i < allFetches.length; i++) {
         const { sym, type } = allFetches[i];
         const lbl = type === "1h" ? "1H" : type === "15m" ? "15min" : "Diario";
-        setProgress(`${lbl} ${sym} (${i+1}/${allFetches.length})…`);
-        if (type === "1h")  h1Data[sym]  = await fetch1HBars(sym, apiKey);
-        else if (type === "15m") m15Data[sym] = await fetch15MinBars(sym, apiKey);
-        else                dayData[sym] = await fetchDailyBars(sym, apiKey);
+        setProgress(`Yahoo Finance — ${lbl} ${sym} (${i+1}/${allFetches.length})…`);
+        if (type === "1h")       h1Data[sym]  = await fetch1HBars(sym);
+        else if (type === "15m") m15Data[sym] = await fetch15MinBars(sym);
+        else                     dayData[sym] = await fetchDailyBars(sym);
         if (i < allFetches.length - 1) {
-          for (let s = 15; s >= 1; s--) {
-            setProgress(`Esperando ${s}s — límite API… (${i+1}/${allFetches.length})`);
+          for (let s = 3; s >= 1; s--) {
+            setProgress(`Esperando ${s}s… (${i+1}/${allFetches.length})`);
             await new Promise(r => setTimeout(r, 1000));
           }
         }
       }
-      setProgress("Detectando señales (E1–E4, E7–E8)…");
+      setProgress("Detectando señales (E1–E8)…");
       await new Promise(r => setTimeout(r, 50));
       setResults(runBacktest(h1Data, m15Data, dayData));
     } catch(e) { setError(e.message); }
@@ -2719,7 +2708,7 @@ function TabBacktest({ apiKey }) {
       {/* Header */}
       <div className="flex justify-between items-center">
         <h2 className="text-white font-bold">Backtest — Últimos 3 Meses</h2>
-        <button onClick={run} disabled={running || !apiKey}
+        <button onClick={run} disabled={running}
           className="bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white text-xs font-bold px-4 py-2 rounded-xl transition-all flex items-center gap-1.5">
           <span className={running ? "animate-spin inline-block" : ""}>
             {running ? "⟳" : "▶"}
@@ -2730,7 +2719,7 @@ function TabBacktest({ apiKey }) {
 
       {/* Methodology note */}
       <div className="bg-slate-800/60 border border-slate-700/40 rounded-xl px-3 py-2.5 space-y-0.5">
-        <div className="text-slate-300 text-xs font-semibold mb-1">8 Estrategias — Metodología Kaizen · DIA→HORA→15MIN</div>
+        <div className="text-slate-300 text-xs font-semibold mb-1">8 Estrategias — Yahoo Finance · 1H (3mo) + 15min (60d) + Diario (6mo)</div>
         <div className="text-slate-400 text-xs font-medium mt-0.5 mb-1">Reglas globales</div>
         <div className="text-slate-500 text-xs">• Mínimo 2 días de tendencia (E1–E4, E7–E8) · E5/E6 exentas (lateral apertura)</div>
         <div className="text-slate-500 text-xs">• Orden análisis: DIA → HORA → 15min (solo BB) · PM lateral = NO rebote</div>
